@@ -1,0 +1,352 @@
+# Daily Wayback Machine snapshot of Somerville Watch Co. policy, legal,
+# collection, and product pages.
+#
+# Required GitHub repository secrets:
+#   ARCHIVE_ORG_ACCESS_KEY
+#   ARCHIVE_ORG_SECRET_KEY
+#
+# TWO DAILY SCHEDULES, both in US overnight hours (3-6am Eastern).
+# Archive.org publishes no hour-by-hour load data, so this targets the
+# hours when its largest (US) audience is asleep. The same window is
+# also the store's own lowest-traffic period (Shopify sessions by hour),
+# which lowers the odds of Shopify telling Archive.org the site is
+# "overloaded" (error:host-crawling-paused). Times are off the top of
+# the hour, where GitHub's scheduler is busiest and most often delays
+# or drops scheduled runs.
+# 1. Primary run (08:07 UTC = 4:07am EDT / 3:07am EST).
+# 2. Retry run (09:43 UTC = 5:43am EDT / 4:43am EST). Same job. The freshness check
+#    means only pages that failed on the primary run actually get
+#    re-attempted; anything that already succeeded is a near-free check.
+#    A concurrency group makes the retry wait for the primary to finish
+#    instead of overlapping with it (overlap would trip Archive.org's
+#    concurrent-session limit).
+#
+# TWO TIERS, BOTH FULLY VERIFIED (nothing is "assumed" captured):
+# 1. Policy/legal pages (13 URLs). Each capture is submitted, then
+#    polled against Archive.org's real status endpoint until it reports
+#    success or failure. A failed or stuck-pending attempt is
+#    resubmitted from scratch (a fresh job_id) up to 3 times total,
+#    with a 90s cooldown between attempts, before it counts as a real
+#    failure - most "error:job-failed" responses are transient on
+#    Archive.org's end. Only exhausting all retries fails the job.
+#    Pages are submitted 10s apart.
+# 2. Collection pages and EVERY product page, each submitted
+#    individually, once per run (no outlinks), and polled/confirmed the
+#    same way as tier 1. The product list is enumerated live from
+#    /collections/all on every run, so new products are picked up
+#    automatically. Each page gets a single attempt per run (the 09:43
+#    UTC retry run re-attempts failures), 15s apart. A failure here is
+#    reported in the run log and summary but does not fail the job.
+#    This replaces the earlier capture_outlinks approach, which only
+#    partly completed on Archive.org's side and gave no per-page
+#    confirmation, leaving many products with sporadic captures.
+#
+# A time budget (290 min) stops tier 2 from starting new pages near
+# GitHub's 6h job limit; the job also has timeout-minutes: 340.
+#
+# IMPORTANT: Save Page Now is asynchronous. Submitting a capture only
+# returns a job_id - it does NOT mean the page was actually archived.
+# Both tiers poll the real status endpoint for each job and only
+# report success once Archive.org confirms the capture completed.
+#
+# NOTE: the capture request must POST to https://web.archive.org/save/
+# with the target url as a form field (url=...) to get back a job_id.
+# Appending the target url directly to the path (/save/{url}) is an
+# older fire-and-forget style endpoint that returns an empty {} body -
+# it can trigger captures but gives no way to confirm they succeeded.
+name: Daily Wayback Machine Policy Snapshot
+on:
+  schedule:
+    # GitHub Actions schedules use UTC. Both stay inside the 3-6am
+    # Eastern (US overnight) window year-round (EDT and EST).
+    # 08:07 UTC = 4:07am EDT / 3:07am EST (primary run).
+    - cron: '7 8 * * *'
+    # 09:43 UTC = 5:43am EDT / 4:43am EST (retry run).
+    - cron: '43 9 * * *'
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: wayback-snapshot
+  cancel-in-progress: false
+jobs:
+  archive-pages:
+    name: Archive policy, collection, and product pages
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      ARCHIVE_ORG_ACCESS_KEY: ${{ secrets.ARCHIVE_ORG_ACCESS_KEY }}
+      ARCHIVE_ORG_SECRET_KEY: ${{ secrets.ARCHIVE_ORG_SECRET_KEY }}
+    steps:
+      - name: Submit pages and confirm real capture completion
+        shell: bash
+        run: |
+          set -uo pipefail
+          auth_header="Authorization: LOW ${ARCHIVE_ORG_ACCESS_KEY}:${ARCHIVE_ORG_SECRET_KEY}"
+
+          # Prints the age in hours of the most recent capture if it's
+          # within the given threshold (hours); prints nothing
+          # otherwise. Used by all tiers so each one's retry/recheck
+          # logic only re-attempts pages that didn't already succeed.
+          get_fresh_age_hours() {
+            local url="$1"
+            local threshold="$2"
+            local encoded_url
+            encoded_url="$(jq -rn --arg u "${url}" '$u|@uri')"
+            local avail_response
+            avail_response="$(curl --silent --show-error \
+              "https://archive.org/wayback/available?url=${encoded_url}" \
+              --max-time 15)" || avail_response=""
+            local closest_ts
+            closest_ts="$(echo "${avail_response}" | jq -r '.archived_snapshots.closest.timestamp // empty' 2>/dev/null || true)"
+            if [[ -z "${closest_ts}" ]]; then
+              return
+            fi
+            local closest_epoch
+            closest_epoch="$(date -u -d "${closest_ts:0:4}-${closest_ts:4:2}-${closest_ts:6:2} ${closest_ts:8:2}:${closest_ts:10:2}:${closest_ts:12:2}" +%s 2>/dev/null || echo 0)"
+            local now_epoch
+            now_epoch="$(date -u +%s)"
+            if [[ "${closest_epoch}" -le 0 ]]; then
+              return
+            fi
+            local age=$(( (now_epoch - closest_epoch) / 3600 ))
+            if [[ "${age}" -ge 0 && "${age}" -lt "${threshold}" ]]; then
+              echo "${age}"
+            fi
+          }
+
+          # Submits one URL directly (no outlinks) and polls until
+          # Archive.org confirms success or failure. If the attempt
+          # fails (or the submission itself is rejected), it is
+          # resubmitted from scratch - a fresh job_id each time - up
+          # to max_retries total attempts, with a 90s cooldown
+          # between them, since a resubmission a bit later frequently
+          # succeeds where the first attempt hit a transient
+          # Archive.org-side error. Echoes "success",
+          # "pending", or "failed:<status>" as its final line (the
+          # result of the LAST attempt) so callers can branch on it.
+          submit_and_confirm() {
+            local url="$1"
+            local max_retries="${2:-3}"
+            local attempt=1
+            local result="failed:unknown"
+
+            while [[ "${attempt}" -le "${max_retries}" ]]; do
+              if [[ "${attempt}" -gt 1 ]]; then
+                echo "${url}: retry attempt ${attempt}/${max_retries} (previous result: ${result})..." >&2
+                sleep 90
+              fi
+
+              local submit_response
+              submit_response="$(curl \
+                --silent \
+                --show-error \
+                --request POST "https://web.archive.org/save/" \
+                --header "Accept: application/json" \
+                --header "${auth_header}" \
+                --data-urlencode "url=${url}" \
+                --max-time 30)" || submit_response=""
+
+              local job_id
+              job_id="$(echo "${submit_response}" | jq -r '.job_id // empty' 2>/dev/null || true)"
+
+              if [[ -z "${job_id}" ]]; then
+                echo "::warning::${url}: attempt ${attempt}/${max_retries} - submission did not return a job_id. Raw response: ${submit_response}" >&2
+                result="failed:no-job-id"
+                attempt=$((attempt + 1))
+                continue
+              fi
+
+              echo "${url}: job submitted (job_id=${job_id}, attempt ${attempt}/${max_retries}). Polling for real completion..." >&2
+
+              local status="pending"
+              local status_ext=""
+              local attempts=0
+              local max_attempts=15   # 15 x 5s = up to 75s wait
+
+              while [[ "${status}" == "pending" && "${attempts}" -lt "${max_attempts}" ]]; do
+                sleep 5
+                attempts=$((attempts + 1))
+                local status_response
+                status_response="$(curl \
+                  --silent \
+                  --show-error \
+                  --header "Accept: application/json" \
+                  --header "${auth_header}" \
+                  "https://web.archive.org/save/status/${job_id}")" || status_response=""
+                status="$(echo "${status_response}" | jq -r '.status // "pending"' 2>/dev/null || echo "pending")"
+                status_ext="$(echo "${status_response}" | jq -r '.status_ext // empty' 2>/dev/null || true)"
+              done
+
+              if [[ "${status}" == "success" ]]; then
+                echo "${url}: capture CONFIRMED successful after ${attempts} check(s) (attempt ${attempt}/${max_retries})." >&2
+                echo "success"
+                return
+              elif [[ "${status}" == "pending" ]]; then
+                echo "${url}: still pending after ${max_attempts} checks (attempt ${attempt}/${max_retries})." >&2
+                result="pending"
+              else
+                echo "::warning::${url}: attempt ${attempt}/${max_retries} FAILED - status=${status} status_ext=${status_ext}" >&2
+                result="failed:${status}"
+              fi
+
+              attempt=$((attempt + 1))
+            done
+
+            if [[ "${result}" == failed:* ]]; then
+              echo "::error::${url}: capture FAILED after ${max_retries} attempts - last result: ${result}" >&2
+            else
+              echo "${url}: still unresolved after ${max_retries} attempts - last result: ${result}" >&2
+            fi
+            echo "${result}"
+          }
+
+          # ==========================================================
+          # Tier 1: policy/legal pages - fully verified, retried 2h later on failure.
+          # The controlled cart permalink includes the active 39mm Date Mod "Silver" Watch:
+          # Variant ID: 51183558787357 | SKU: DJ-Silver-39 | Quantity: 1
+          # Left un-encoded here - curl's --data-urlencode handles encoding.
+          # ==========================================================
+          pages=(
+            "Homepage|https://somervillewatchco.com/"
+            "Refund policy|https://somervillewatchco.com/policies/refund-policy"
+            "Shipping policy|https://somervillewatchco.com/policies/shipping-policy"
+            "Terms of service|https://somervillewatchco.com/policies/terms-of-service"
+            "Privacy policy|https://somervillewatchco.com/policies/privacy-policy"
+            "Contact information|https://somervillewatchco.com/policies/contact-information"
+            "Legal notice|https://somervillewatchco.com/policies/legal-notice"
+            "Contact page|https://somervillewatchco.com/pages/contact"
+            "Warranty policy|https://somervillewatchco.com/pages/warranty-policy"
+            "No brand affiliation|https://somervillewatchco.com/pages/no-brand-affiliation"
+            "Subscription/cancellation policy|https://somervillewatchco.com/policies/subscription-policy"
+            "Empty cart page|https://somervillewatchco.com/cart"
+            "Controlled cart - Date Mod Silver 39mm|https://somervillewatchco.com/cart/51183558787357:1?storefront=true"
+          )
+
+          any_failed=0
+
+          for page in "${pages[@]}"; do
+            label="${page%%|*}"
+            url="${page#*|}"
+            echo "----"
+            echo "Checking: ${label} - ${url}"
+
+            fresh_age="$(get_fresh_age_hours "${url}" 20)"
+            if [[ -n "${fresh_age}" ]]; then
+              echo "${label}: already has a capture from ${fresh_age}h ago - skipping."
+              continue
+            fi
+
+            echo "Submitting: ${label} - ${url}"
+            result="$(submit_and_confirm "${url}")"
+            case "${result}" in
+              success) ;;
+              pending)
+                echo "::warning::${label}: still pending - the retry run later this morning will check again."
+                ;;
+              *)
+                any_failed=1
+                ;;
+            esac
+
+            sleep 10
+          done
+
+          echo "===================="
+          if [[ "${any_failed}" -ne 0 ]]; then
+            echo "One or more policy/legal pages failed to archive - see ::error:: lines above. The retry run later this morning will attempt these again."
+          else
+            echo "All policy/legal pages archived and confirmed successfully (or already had a fresh capture)."
+          fi
+
+          # ==========================================================
+          # Tier 2: collection pages + every product page - each
+          # submitted individually, ONCE per run, no outlinks, and
+          # polled/confirmed like tier 1. The page list is enumerated
+          # live from /collections/all. Pages with a capture newer than
+          # 20h are skipped, so the retry run only redoes failures.
+          # ==========================================================
+          echo "===================="
+          echo "Collection + product pages (individually submitted, verified)"
+          echo "===================="
+
+          echo "Enumerating current catalog..."
+          collection_urls=()
+          all_product_paths=()
+          page=1
+          while true; do
+            if [[ "${page}" -eq 1 ]]; then
+              list_url="https://somervillewatchco.com/collections/all"
+            else
+              list_url="https://somervillewatchco.com/collections/all?page=${page}"
+            fi
+            page_html="$(curl --silent --show-error "${list_url}" --max-time 30)" || page_html=""
+            page_paths="$(echo "${page_html}" | grep -oE '/products/[a-zA-Z0-9-]+' | sort -u)" || page_paths=""
+            if [[ -z "${page_paths}" ]]; then
+              break
+            fi
+            collection_urls+=("${list_url}")
+            while IFS= read -r p; do
+              all_product_paths+=("${p}")
+            done <<< "${page_paths}"
+            page=$((page + 1))
+            if [[ "${page}" -gt 20 ]]; then
+              echo "::warning::Stopped enumerating catalog pages at page 20 as a safety limit."
+              break
+            fi
+          done
+
+          mapfile -t unique_product_paths < <(printf '%s\n' "${all_product_paths[@]}" | sort -u | grep -v '^$')
+          if [[ "${#unique_product_paths[@]}" -eq 0 ]]; then
+            echo "::warning::Could not enumerate any product pages from the live site - skipping the product/collection pass this run."
+          fi
+          echo "Found ${#collection_urls[@]} collection pages and ${#unique_product_paths[@]} unique product pages."
+
+          catalog_urls=("${collection_urls[@]}")
+          for path in "${unique_product_paths[@]}"; do
+            catalog_urls+=("https://somervillewatchco.com${path}")
+          done
+
+          checked=0
+          submitted=0
+          confirmed=0
+          failed_urls=()
+
+          for url in "${catalog_urls[@]}"; do
+            checked=$((checked + 1))
+
+            fresh_age="$(get_fresh_age_hours "${url}" 20)"
+            if [[ -n "${fresh_age}" ]]; then
+              continue
+            fi
+
+            if [[ "${SECONDS}" -ge 17400 ]]; then
+              echo "::warning::Time budget (290 min) reached - remaining pages will be picked up by the next run."
+              break
+            fi
+
+            echo "----"
+            echo "No capture within 20h, submitting: ${url}"
+            submitted=$((submitted + 1))
+
+            result="$(submit_and_confirm "${url}" 1)"
+            if [[ "${result}" == "success" ]]; then
+              confirmed=$((confirmed + 1))
+            else
+              failed_urls+=("${url}")
+            fi
+
+            sleep 15
+          done
+
+          echo "===================="
+          echo "Catalog pass complete: ${checked} pages checked, ${submitted} needed capture, ${confirmed} confirmed successful, ${#failed_urls[@]} not confirmed."
+          if [[ "${#failed_urls[@]}" -gt 0 ]]; then
+            echo "Not confirmed (the next run will re-attempt these):"
+            printf '  %s\n' "${failed_urls[@]}"
+          fi
+
+          echo "===================="
+          if [[ "${any_failed}" -ne 0 ]]; then
+            exit 1
+          fi
