@@ -12,6 +12,24 @@ GOOD = '<html><title>Somerville Watch Co.</title><body>' + ('Watch collection ' 
 FIELDS = ['timestamp', 'original', 'statuscode', 'mimetype', 'digest']
 
 class VerificationTests(unittest.TestCase):
+    @patch('capture.time.sleep')
+    def test_transient_get_retried(self, sleep):
+        c = Client(); c._request = Mock(side_effect=[LookupFailure('timeout'), (200, {}, GOOD, URL)])
+        self.assertEqual(c.request(URL)[0], 200)
+        self.assertEqual(c._request.call_count, 2)
+
+    @patch('capture.time.sleep')
+    def test_post_timeout_not_retried(self, sleep):
+        c = Client(); c._request = Mock(side_effect=LookupFailure('timeout'))
+        with self.assertRaises(LookupFailure): c.request('https://web.archive.org/save/', {'url':URL}, True)
+        self.assertEqual(c._request.call_count, 1)
+
+    @patch('capture.time.sleep')
+    def test_public_read_429_gets_bounded_backoff(self, sleep):
+        c = Client(); c._request = Mock(side_effect=[(429, {}, '', URL), (200, {}, GOOD, URL)])
+        self.assertEqual(c.request(URL)[0], 200)
+        sleep.assert_any_call(30)
+
     def client(self, code='200', mime='text/html', body=GOOD, final=None):
         c = Client()
         ts = timestamp(time.time() - 10)

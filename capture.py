@@ -42,6 +42,26 @@ class NoRedirect(ur.HTTPRedirectHandler):
 
 class Client:
     def request(self, url, data=None, authenticated=False):
+        # Read endpoints can fail transiently. Never retry a POST whose outcome
+        # might already have created a job. Pace public archive reads as well.
+        for attempt in range(2 if data is None else 1):
+            if data is None and up.urlsplit(url).hostname == 'web.archive.org':
+                wait = max(0, getattr(self, '_last_read', 0) + 2 - time.time())
+                if wait:
+                    time.sleep(wait)
+                self._last_read = time.time()
+            try:
+                response = self._request(url, data, authenticated)
+                if data is None and not authenticated and response[0] in (429, 502, 503, 504) and attempt == 0:
+                    time.sleep(30)
+                    continue
+                return response
+            except LookupFailure:
+                if data is not None or attempt == 1:
+                    raise
+                time.sleep(10)
+
+    def _request(self, url, data=None, authenticated=False):
         headers = {'User-Agent': 'SWC-Archive-Verification/1.0', 'Accept-Encoding': 'identity'}
         if authenticated:
             access, secret = os.environ.get('ARCHIVE_ORG_ACCESS_KEY'), os.environ.get('ARCHIVE_ORG_SECRET_KEY')
@@ -57,7 +77,8 @@ class Client:
         except urllib.error.HTTPError as exc:
             response = exc
         except (OSError, TimeoutError) as exc:
-            raise LookupFailure(type(exc).__name__) from None
+            reason = getattr(exc, 'reason', exc)
+            raise LookupFailure('Network read failed: ' + type(reason).__name__) from None
         with response:
             body = response.read(8 * 1024 * 1024 + 1)
             if len(body) > 8 * 1024 * 1024:
