@@ -132,6 +132,13 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.r.process(BASE+'/cart')['state'], 'deferred')
         self.assertEqual(self.c.json.call_count, 1)
 
+    def test_actual_spn_human_pause_message(self):
+        self.c.json.side_effect = [(200, {}, {'job_id':'job'}), (200, {}, {'status':'error',
+            'status_ext':'please try again in ~10 min. crawling this host is paused because they notified us that they are overloaded right now. (http status=429)'})]
+        self.assertEqual(self.r.process(URL)['state'], 'deferred')
+        self.assertGreater(self.r.state['_next_submit'], time.time()+659)
+        self.assertNotIn(URL, self.r.state)
+
     def test_time_budget_is_deferred(self):
         self.r.deadline = time.time()
         self.assertEqual(self.r.process(URL)['state'], 'deferred'); self.c.verify.assert_not_called()

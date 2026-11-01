@@ -199,8 +199,10 @@ class Runner:
         return row
 
     def pause(self, headers, obj):
-        detail = str(obj.get('status_ext', '')) + ' ' + str(obj.get('message', ''))
-        if 'host-crawling-paused' not in detail and obj.get('_http') != 429:
+        detail = (str(obj.get('status_ext', '')) + ' ' + str(obj.get('message', ''))).lower()
+        paused = ('host-crawling-paused' in detail or 'crawling this host is paused' in detail
+                  or bool(re.search(r'http status\s*[=:]\s*429', detail)))
+        if not paused and obj.get('_http') != 429:
             return False
         retry = headers.get('retry-after', '660')
         try:
@@ -309,7 +311,12 @@ def main():
     runner = Runner(client, args.state, args.budget, verify_only=args.verify_only)
     urls = [BASE + p for p in (['/pages/warranty-policy'] if args.scope == 'pilot' else PRIORITY)]
     for url in urls:
-        runner.process(url)
+        result = runner.process(url)
+        if args.scope == 'pilot' and result['state'] == 'deferred' and runner.next_submit > time.time():
+            # One controlled retry after a confirmed refusal and persisted cooldown.
+            # Keep one final record per URL, rather than miscounting both attempts.
+            runner.results.pop()
+            runner.process(url)
     if args.scope == 'all':
         try:
             for url in discover(client):
