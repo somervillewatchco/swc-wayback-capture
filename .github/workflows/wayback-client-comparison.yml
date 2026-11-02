@@ -1,0 +1,33 @@
+name: Public Wayback native-client comparison
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: wayback-snapshot
+  cancel-in-progress: false
+jobs:
+  compare-clients:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Offline comparison regression tests
+        run: |
+          test_dir=$(mktemp -d)
+          trap 'rm -rf "$test_dir"' EXIT
+          cd "$test_dir"
+          env -u GITHUB_STEP_SUMMARY PYTHONPATH="$GITHUB_WORKSPACE" python -m unittest -v test_compare_archive_clients
+      - name: Paced public GET-only client comparison
+        run: python compare_archive_clients.py
+      - name: Publish sanitized comparison
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-comparison-${{ github.run_id }}-${{ github.run_attempt }}
+          path: client-comparison-report.json
+          if-no-files-found: warn
+          retention-days: 90
