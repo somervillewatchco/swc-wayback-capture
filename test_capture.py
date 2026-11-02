@@ -46,6 +46,13 @@ class VerificationTests(unittest.TestCase):
         self.assertIsNone(c.verify(URL, time.time()-60))
         c.request.assert_not_called()
 
+    def test_exact_timestamp_query_rejects_newer_capture(self):
+        c = self.client()
+        target = time.time() - 60
+        self.assertIsNone(c.verify(URL, target, until=target))
+        c.request.assert_not_called()
+        self.assertIn('to=' + timestamp(target), c.json.call_args.args[0])
+
     def test_stale_capture_rejected(self):
         self.assertIsNone(self.client().verify(URL, time.time()))
 
@@ -96,7 +103,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_old_success_rejected(self):
         self.c.json.side_effect = [(200, {}, {'job_id': 'job'}), (200, {}, {'status':'success','original_url':URL,'timestamp':'20200101000000'})]
-        self.assertEqual(self.r.process(URL)['state'], 'pending')
+        self.assertEqual(self.r.process(URL)['state'], 'review_required')
 
     def test_job_success_without_index_is_pending(self):
         self.c.json.side_effect = [(200, {}, {'job_id':'job'})] + [(200, {}, {'status':'success','original_url':URL,'timestamp':timestamp(time.time())})]*12
@@ -139,7 +146,7 @@ class RunnerTests(unittest.TestCase):
             'status_ext':'please try again in ~10 min. crawling this host is paused because they notified us that they are overloaded right now. (http status=429)'})]
         self.assertEqual(self.r.process(URL)['state'], 'deferred')
         self.assertGreater(self.r.state['_next_submit'], time.time()+659)
-        self.assertNotIn(URL, self.r.state)
+        self.assertEqual(self.r.state[URL]['job_id'], 'job')
 
     def test_time_budget_is_deferred(self):
         self.r.deadline = time.time()
@@ -170,14 +177,14 @@ class RunnerTests(unittest.TestCase):
     def test_missing_original_url_is_not_success(self):
         self.c.json.side_effect = [(200, {}, {'job_id':'job'}),
             (200, {}, {'status':'success','timestamp':timestamp(time.time())})]
-        self.assertEqual(self.r.process(URL)['state'], 'pending')
+        self.assertEqual(self.r.process(URL)['state'], 'review_required')
 
     def test_ambiguous_success_preserved_without_duplicate_post(self):
         self.c.json.side_effect = [(200, {}, {'job_id': 'job'}),
             (200, {}, {'status': 'success', 'timestamp': '20200101000000',
                        'original_url': URL})]
         result = self.r.process(URL)
-        self.assertEqual(result['state'], 'pending')
+        self.assertEqual(result['state'], 'review_required')
         self.assertEqual(result['job_id'], 'job')
         self.assertFalse(result['status_evidence']['timestamp_fresh'])
         self.assertEqual(result['status_evidence']['timestamp'], '20200101000000')
@@ -187,9 +194,8 @@ class RunnerTests(unittest.TestCase):
         self.c.json.return_value = (200, {}, {'status': 'success'})
         self.c.json.reset_mock()
         again = Runner(self.c, 'state.json')
-        self.assertEqual(again.process(URL)['state'], 'pending')
-        self.assertEqual(self.c.json.call_count, 1)
-        self.assertEqual(self.c.json.call_args.args[0], 'https://web.archive.org/save/status/job')
+        self.assertEqual(again.process(URL)['state'], 'review_required')
+        self.c.json.assert_not_called()
         self.assertIn(URL, again.state)
 
     def test_ambiguous_success_diagnostics_exclude_secrets(self):
@@ -198,7 +204,7 @@ class RunnerTests(unittest.TestCase):
              'timestamp': 'secret', 'original_url': 'https://evil.example/?token=secret',
              'message': 'secret', 'access_key': 'secret'})]
         result = self.r.process(URL)
-        self.assertEqual(result['state'], 'pending')
+        self.assertEqual(result['state'], 'review_required')
         self.assertFalse(result['status_evidence']['original_url_matches'])
         self.assertFalse(result['status_evidence']['timestamp_valid_format'])
         self.assertNotIn('secret', Path('state.json').read_text())
@@ -208,7 +214,7 @@ class RunnerTests(unittest.TestCase):
         self.c.json.side_effect = [(200, {}, {'job_id': 'job'}),
             (200, {}, {'status': 'success', 'timestamp': timestamp(time.time()),
                        'original_url': {'unexpected': 'object'}})]
-        self.assertEqual(self.r.process(URL)['state'], 'pending')
+        self.assertEqual(self.r.process(URL)['state'], 'review_required')
         self.assertIn(URL, self.r.state)
 
     def test_read_only_recovery_preserves_ambiguous_job(self):
@@ -250,7 +256,7 @@ class RunnerTests(unittest.TestCase):
             'original_url': URL, 'timestamp': '20200101000000'})
         other = Runner(self.c, 'state.json', poll_only=True)
         result = other.process(URL)
-        self.assertEqual(result['state'], 'pending')
+        self.assertEqual(result['state'], 'review_required')
         self.assertEqual(result['job_id'], 'saved-job')
         self.assertFalse(result['status_evidence']['timestamp_fresh'])
         self.c.json.assert_called_once_with('https://web.archive.org/save/status/saved-job', authenticated=True)
@@ -289,9 +295,155 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(report), 1)
         self.assertEqual(report[0]['state'], 'deferred')
 
+    def old_success_state(self):
+        ts = timestamp(self.r.since - 60)
+        self.r.state[URL] = {'job_id': 'saved-job', 'submitted_at': time.time(),
+            'status_evidence': {'status': 'success', 'original_url_matches': True,
+                               'timestamp': ts}}
+        self.r.save()
+        evidence = {'timestamp': ts, 'original': URL, 'statuscode': '200',
+                    'mimetype': 'text/html', 'replay_url': 'https://web.archive.org/web/' + ts + 'id_/' + URL}
+        self.c.verify.side_effect = lambda url, since, until=None: evidence if until is not None else None
+        return evidence
+
+    def test_saved_success_migrates_read_only_and_no_forever_poll(self):
+        evidence = self.old_success_state()
+        self.r.verify_only = True
+        self.assertEqual(self.r.process(URL)['state'], 'reused')
+        self.assertEqual(self.r.state[URL]['terminal_reused'], evidence)
+        self.assertEqual(self.r.state[URL]['retry_eligible_at'], self.r.since + 86400)
+        self.c.json.assert_not_called()
+        self.r.verify_only = False
+        self.assertEqual(self.r.process(URL)['state'], 'deferred')
+        self.c.json.assert_not_called()
+        self.assertEqual(len([c for c in self.c.verify.call_args_list if c.kwargs.get('until')]), 1)
+
+    def test_terminal_reused_next_day_one_regular_post_and_audit(self):
+        self.old_success_state()
+        self.r.process(URL)
+        self.r.state[URL]['retry_eligible_at'] = self.r.since - 1
+        self.c.json.side_effect = [(200, {}, {'job_id': 'new-job'})] + [(200, {}, {'status': 'pending'})] * 12
+        self.assertEqual(self.r.process(URL)['state'], 'pending')
+        posts = [call for call in self.c.json.call_args_list if call.args[0] == 'https://web.archive.org/save/']
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(self.r.state['_completed_jobs'][-1]['job_id'], 'saved-job')
+        self.assertEqual(self.r.state[URL]['job_id'], 'new-job')
+
+    def test_terminal_reused_poll_only_never_releases_even_when_due(self):
+        self.old_success_state(); self.r.process(URL)
+        self.r.state[URL]['retry_eligible_at'] = self.r.since - 1
+        self.r.poll_only = True
+        self.assertEqual(self.r.process(URL)['state'], 'deferred')
+        self.assertEqual(self.r.state[URL]['job_id'], 'saved-job')
+        self.c.json.assert_not_called()
+
+    def test_same_utc_day_reuse_is_coverage_not_new_capture(self):
+        ts = timestamp(self.r.since + 1)
+        self.c.verify.side_effect = [None, {'timestamp': ts}]
+        self.c.json.side_effect = [(200, {}, {'job_id': 'job'}),
+            (200, {}, {'status': 'success', 'original_url': URL, 'timestamp': ts})]
+        result = self.r.process(URL)
+        self.assertEqual(result['state'], 'verified')
+        self.assertFalse(result['new_capture'])
+        self.assertNotIn(URL, self.r.state)
+
+    def test_prior_day_capture_requires_exact_evidence(self):
+        self.old_success_state()
+        self.c.verify.side_effect = None
+        self.c.verify.return_value = None
+        self.r.poll_only = True
+        self.c.json.return_value = (200, {}, {'status': 'success', 'original_url': URL,
+                                             'timestamp': timestamp(self.r.since - 60)})
+        self.assertEqual(self.r.process(URL)['state'], 'review_required')
+        self.assertNotIn('terminal_reused', self.r.state[URL])
+
+    def test_terminal_reuse_honors_longer_server_retry_after(self):
+        ts = timestamp(self.r.since - 60)
+        evidence = {'timestamp': ts}
+        self.c.verify.side_effect = [None, None, evidence]
+        self.c.json.side_effect = [(200, {}, {'job_id': 'job'}),
+            (200, {'retry-after': '172800'}, {'status': 'success', 'original_url': URL, 'timestamp': ts})]
+        self.assertEqual(self.r.process(URL)['state'], 'reused')
+        self.assertGreater(self.r.state[URL]['retry_eligible_at'], time.time() + 172799)
+
+    def test_status_expired_unknown_is_review_required_not_reposted(self):
+        self.r.state[URL] = {'job_id': 'expired', 'submitted_at': time.time() - 10000}
+        self.c.json.return_value = (404, {}, {'status': 'error'})
+        self.assertEqual(self.r.process(URL)['state'], 'review_required')
+        self.c.json.reset_mock()
+        self.assertEqual(self.r.process(URL)['state'], 'review_required')
+        self.c.json.assert_not_called()
+        self.assertEqual(self.r.state[URL]['job_id'], 'expired')
+
+    def test_unknown_error_text_is_not_echoed(self):
+        self.c.json.return_value = (401, {}, {'status': 'error', 'status_ext': 'secret-token-123'})
+        result = self.r.process(URL)
+        self.assertEqual(result['status_ext'], 'unknown')
+        self.assertNotIn('secret-token-123', Path('capture-report.json').read_text())
+
+    def test_terminal_reuse_honors_http_date_retry_after(self):
+        from email.utils import formatdate
+        ts = timestamp(self.r.since - 60)
+        deadline = time.time() + 172800
+        self.c.verify.side_effect = [None, None, {'timestamp': ts}]
+        self.c.json.side_effect = [(200, {}, {'job_id': 'job'}),
+            (200, {'retry-after': formatdate(deadline, usegmt=True)},
+             {'status': 'success', 'original_url': URL, 'timestamp': ts})]
+        self.assertEqual(self.r.process(URL)['state'], 'reused')
+        self.assertAlmostEqual(self.r.state[URL]['retry_eligible_at'], deadline, delta=1)
+
+    def test_submission_response_diagnostics_are_sanitized_and_preserved(self):
+        self.c.json.side_effect = [(200, {'retry-after': '172800'},
+            {'job_id': 'job', 'status': 'success', 'message': 'Same snapshot secret-token', 'secret': 'secret-token'}),
+            (200, {}, {'status': 'success', 'original_url': URL, 'timestamp': '20200101000000'})]
+        result = self.r.process(URL)
+        response = result['submission_response']
+        self.assertEqual(response['message_classification'], 'same_snapshot')
+        self.assertEqual(response['http_status'], 200)
+        self.assertGreater(response['retry_after_until'], time.time() + 172799)
+        self.assertNotIn('secret-token', Path('state.json').read_text())
+        self.assertNotIn('secret-token', Path('capture-report.json').read_text())
+
+    def test_existing_daily_index_never_claims_new_capture(self):
+        self.c.verify.return_value = {'timestamp': timestamp(time.time())}
+        result = self.r.process(URL)
+        self.assertFalse(result['new_capture'])
+        self.assertEqual(result['coverage_source'], 'existing_index')
+        self.c.json.assert_not_called()
+
+    def test_status_429_retains_job_and_next_run_never_reposts(self):
+        self.c.json.side_effect = [(200, {}, {'job_id': 'accepted-job'}),
+                                    (429, {'retry-after': '900'}, {'status': 'error'})]
+        self.assertEqual(self.r.process(URL)['state'], 'deferred')
+        saved = json.loads(Path('state.json').read_text())
+        self.assertEqual(saved[URL]['job_id'], 'accepted-job')
+        self.assertGreater(saved[URL]['status_paused_until'], time.time() + 899)
+        self.c.json.reset_mock()
+        other = Runner(self.c, 'state.json')
+        self.assertEqual(other.process(URL)['state'], 'deferred')
+        self.c.json.assert_not_called()
+        other.state[URL]['status_paused_until'] = 0
+        self.c.json.side_effect = None
+        self.c.json.return_value = (200, {}, {'status': 'pending'})
+        self.assertEqual(other.process(URL)['state'], 'pending')
+        self.assertTrue(all(c.args[0].endswith('/status/accepted-job') for c in self.c.json.call_args_list))
+
+    def test_unknown_status_error_preserves_review_required_job(self):
+        self.r.state[URL] = {'job_id': 'saved-job', 'submitted_at': time.time()}
+        self.c.json.return_value = (200, {}, {'status': 'error', 'status_ext': 'unknown-or-expired'})
+        self.assertEqual(self.r.process(URL)['state'], 'review_required')
+        self.assertEqual(self.r.state[URL]['job_id'], 'saved-job')
+
     def test_incomplete_main_returns_nonzero(self):
         from capture import main
         with patch('sys.argv', ['capture.py', '--verify-only', '--scope', 'pilot']), patch('capture.Client', return_value=self.c):
             self.assertEqual(main(), 1)
+
+class WorkflowTests(unittest.TestCase):
+    def test_recovery_cache_is_not_promoted_to_production(self):
+        workflow = (Path(__file__).resolve().parent / '.github/workflows/wayback-snapshot.yml').read_text()
+        self.assertIn("key: ${{ inputs.recovery_cache_key && 'wayback-recovery-v1' || 'wayback-state-v1' }}", workflow)
+        self.assertIn("restore-keys: ${{ !inputs.recovery_cache_key && 'wayback-state-v1-' || '' }}", workflow)
+        self.assertIn('args+=(--poll-only)', workflow)
 
 if __name__ == '__main__': unittest.main()

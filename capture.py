@@ -35,6 +35,45 @@ def identity(url):
         return None
     return (p.path.rstrip('/') or '/', tuple(sorted(up.parse_qsl(p.query, keep_blank_values=True))))
 
+def safe_status_ext(value):
+    allowed = {'error:' + name for name in (
+        'bad-gateway bad-request bandwidth-limit-exceeded blocked blocked-client-ip '
+        'blocked-url browsing-timeout capture-location-error cannot-fetch celery filesize-limit '
+        'ftp-access-denied gateway-timeout http-version-not-supported internal-server-error '
+        'invalid-url-syntax invalid-server-response invalid-host-resolution job-failed '
+        'method-not-allowed not-implemented no-browsers-available network-authentication-required '
+        'no-access not-found proxy-error protocol-error read-timeout soft-time-limit-exceeded '
+        'service-unavailable too-many-daily-captures too-many-redirects too-many-requests '
+        'user-session-limit unauthorized max-daily-bandwidth max-daily-bandwidth-from-ip '
+        'max-daily-bandwidth-host').split()}
+    return value if isinstance(value, str) and value in allowed else 'unknown'
+
+def response_metadata(http_status, headers, obj):
+    """Allowlisted diagnostics only; never return raw messages, URLs or headers."""
+    status = obj.get('status')
+    message = obj.get('message', '')
+    message = message.lower() if isinstance(message, str) else ''
+    classification = ('same_snapshot' if 'same snapshot' in message else
+                      'recent_capture' if 'recent capture' in message or 'already archived' in message else
+                      'unknown')
+    result = {'http_status': http_status,
+              'status': status if status in ('success', 'pending', 'error') else 'unknown',
+              'status_ext': safe_status_ext(obj.get('status_ext')),
+              'message_classification': classification}
+    retry = headers.get('retry-after')
+    if retry is not None:
+        try:
+            deadline = time.time() + max(0, int(retry))
+        except (ValueError, TypeError, OverflowError):
+            from email.utils import parsedate_to_datetime
+            try:
+                deadline = parsedate_to_datetime(retry).timestamp()
+            except (ValueError, TypeError, OverflowError):
+                deadline = 0
+        if deadline > 0:
+            result['retry_after_until'] = deadline
+    return result
+
 class LookupFailure(Exception):
     pass
 
@@ -99,9 +138,9 @@ class Client:
             raise LookupFailure('Non-JSON response (HTTP %s)' % status) from None
         return status, {k.lower(): v for k, v in headers.items()}, obj
 
-    def verify(self, url, since):
+    def verify(self, url, since, until=None):
         query = up.urlencode({'url': url, 'matchType': 'exact', 'from': timestamp(since),
-            'to': timestamp(time.time() + 60), 'output': 'json',
+            'to': timestamp(min(until, time.time() + 60) if until is not None else time.time() + 60), 'output': 'json',
             'fl': 'timestamp,original,statuscode,mimetype,digest'})
         status, _, data = self.json('https://web.archive.org/cdx/search/cdx?' + query)
         if status != 200 or not isinstance(data, list):
@@ -120,7 +159,7 @@ class Client:
             if identity(row['original']) != identity(url) or not identity(url):
                 continue
             try:
-                if not since <= epoch(row['timestamp']) <= time.time() + 60:
+                if not since <= epoch(row['timestamp']) <= (min(until, time.time() + 60) if until is not None else time.time() + 60):
                     continue
             except ValueError:
                 continue
@@ -204,8 +243,9 @@ class Runner:
             row['job_id'] = job_id
         if isinstance(pending.get('submitted_at'), (int, float)):
             row['submitted_at'] = pending['submitted_at']
-        if pending.get('status_evidence'):
-            row['status_evidence'] = pending['status_evidence']
+        for key in ('status_evidence', 'request_evidence', 'terminal_reused', 'retry_eligible_at', 'review_required', 'submission_response', 'status_response'):
+            if key in pending:
+                row[key] = pending[key]
         self.results.append(row)
         print(json.dumps(row), flush=True)
         Path('capture-report.json').write_text(json.dumps(self.results, indent=2))
@@ -231,6 +271,42 @@ class Runner:
         self.save()
         return True
 
+    def classify_success(self, url, pending, check_daily=True):
+        """Resolve a completed job using archive evidence, never status alone."""
+        status = pending.get('status_evidence', {})
+        if status.get('status') != 'success' or not status.get('original_url_matches'):
+            return None
+        if not isinstance(status.get('timestamp'), str) or not re.fullmatch(r'[0-9]{14}', status['timestamp']):
+            return None
+        try:
+            captured_at = epoch(status.get('timestamp', ''))
+        except (ValueError, TypeError):
+            return None
+        if captured_at > time.time() + 60:
+            return None
+        if check_daily:
+            evidence = self.client.verify(url, self.since)
+            if evidence:
+                new_capture = epoch(evidence['timestamp']) >= pending['submitted_at'] - 5
+                self.state.pop(url, None)
+                self.save()
+                return self.result(url, 'verified', new_capture=new_capture, **evidence)
+        if captured_at >= self.since:
+            return None  # Current-day indexing may still be pending.
+        evidence = self.client.verify(url, captured_at, until=captured_at)
+        if not evidence or evidence.get('timestamp') != status['timestamp']:
+            return None
+        # This job is definitively completed with a usable older capture. Do
+        # not poll it forever or call it today's coverage. The next UTC day's
+        # regular opportunity is our scheduling policy, not an Archive limit.
+        attempt_day = dt.datetime.fromtimestamp(pending['submitted_at'], UTC).replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp()
+        pending['terminal_reused'] = evidence
+        pending['retry_eligible_at'] = max(attempt_day + 86400,
+            pending.get('server_retry_after_until', 0))
+        self.save()
+        return self.result(url, 'reused', reason='completed capture predates UTC day; no new submission in this run')
+
     def process(self, url):
         if time.time() + 35 >= self.deadline:
             return self.result(url, 'deferred', reason='run time budget')
@@ -239,10 +315,30 @@ class Runner:
             if evidence:
                 self.state.pop(url, None)
                 self.save()
-                return self.result(url, 'verified', **evidence)
+                return self.result(url, 'verified', coverage_source='existing_index', new_capture=False, **evidence)
+            pending = self.state.get(url)
+            if pending and not pending.get('terminal_reused'):
+                # Migrate saved successes (including earlier releases) by
+                # read-only exact CDX/replay, without requiring a live job ID.
+                resolved = self.classify_success(url, pending, check_daily=False)
+                if resolved:
+                    return resolved
             if self.verify_only:
                 return self.result(url, 'unverified', reason='no usable indexed capture for UTC day')
-            pending = self.state.get(url)
+            if pending and pending.get('terminal_reused'):
+                if self.poll_only or time.time() < pending['retry_eligible_at']:
+                    return self.result(url, 'deferred', reason='completed reused capture; awaiting next eligible UTC-day opportunity')
+                # Preserve a bounded audit trail before the next regular attempt.
+                completed = self.state.setdefault('_completed_jobs', [])
+                completed.append({'url': url, **pending})
+                self.state['_completed_jobs'] = completed[-50:]
+                self.state.pop(url)
+                self.save()
+                pending = None
+            if pending and pending.get('review_required'):
+                return self.result(url, 'review_required', reason='saved job outcome needs review; archive evidence still checked, no submission or status polling')
+            if pending and pending.get('status_paused_until', 0) > time.time():
+                return self.result(url, 'deferred', reason='status lookup cooldown; existing job retained')
             if not pending and self.poll_only:
                 return self.result(url, 'unverified', reason='no saved job to poll; no submission made')
             if not pending:
@@ -252,7 +348,9 @@ class Runner:
                 if delay:
                     print('Waiting %ss before next submission' % int(delay), flush=True)
                     time.sleep(delay)
-                pending = {'submitted_at': time.time(), 'job_id': None}
+                pending = {'submitted_at': time.time(), 'job_id': None,
+                    'request_evidence': {'method': 'POST', 'endpoint': 'https://web.archive.org/save/',
+                                         'if_not_archived_within': '1'}}
                 # Persist BEFORE POST: a network timeout has an uncertain outcome.
                 self.state[url] = pending
                 self.state['_next_submit'] = self.next_submit = time.time() + self.interval
@@ -262,17 +360,21 @@ class Runner:
                 if not isinstance(obj, dict):
                     raise LookupFailure('Invalid submission response')
                 obj['_http'] = status
+                pending['submission_response'] = response_metadata(status, headers, obj)
+                if pending['submission_response'].get('retry_after_until'):
+                    pending['server_retry_after_until'] = pending['submission_response']['retry_after_until']
+                self.save()
                 if self.pause(headers, obj):
                     self.state.pop(url, None)  # Explicit refusal, safe to try after cooldown.
                     self.save()
-                    return self.result(url, 'deferred', reason='host crawling paused')
+                    return self.result(url, 'deferred', reason='host crawling paused', response=response_metadata(status, headers, obj))
                 job_id = obj.get('job_id')
                 if not isinstance(job_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', job_id):
                     if obj.get('status') == 'error' or status in (400, 401, 403):
                         self.state.pop(url, None)
                         self.save()
                         return self.result(url, 'failed', reason='submission explicitly rejected', http_status=status,
-                                           status_ext=obj.get('status_ext', 'unknown'))
+                                           status_ext=safe_status_ext(obj.get('status_ext')), response=pending['submission_response'])
                     return self.result(url, 'pending', reason='submission outcome unknown; no automatic duplicate')
                 pending['job_id'] = job_id
                 self.save()
@@ -285,10 +387,22 @@ class Runner:
                 if not isinstance(obj, dict):
                     raise LookupFailure('Invalid status response')
                 obj['_http'] = status
+                pending['status_response'] = response_metadata(status, headers, obj)
+                if pending['status_response'].get('retry_after_until'):
+                    pending['server_retry_after_until'] = max(pending.get('server_retry_after_until', 0),
+                        pending['status_response']['retry_after_until'])
+                self.save()
                 if self.pause(headers, obj):
-                    self.state.pop(url, None)
+                    # Throttling the status lookup does not prove the accepted
+                    # capture was refused. Keep its job to prevent a duplicate.
+                    pending['status_paused_until'] = self.next_submit
                     self.save()
-                    return self.result(url, 'deferred', reason='host crawling paused')
+                    return self.result(url, 'deferred', reason='status lookup paused; existing job retained', response=response_metadata(status, headers, obj))
+                if status in (404, 410):
+                    pending['review_required'] = True
+                    pending['status_lookup_http'] = status
+                    self.save()
+                    return self.result(url, 'review_required', reason='job status unavailable or expired; no automatic resubmission')
                 if status != 200:
                     raise LookupFailure('Status endpoint HTTP %s' % status)
                 if obj.get('status') == 'success':
@@ -314,20 +428,22 @@ class Runner:
                     if original_matches:
                         pending['status_evidence']['original_url'] = url
                     self.save()
+                    resolved = self.classify_success(url, pending)
+                    if resolved:
+                        return resolved
                     if not fresh or not original_matches:
-                        # A claimed success can still represent a real job.
-                        # Preserve its ID so a later run rechecks, never reposts.
-                        return self.result(url, 'pending', reason='job success has stale/missing timestamp or different URL; retained for review')
-                    evidence = self.client.verify(url, max(self.since, pending['submitted_at'] - 5))
-                    if evidence:
-                        self.state.pop(url, None)
+                        pending['review_required'] = True
                         self.save()
-                        return self.result(url, 'verified', **evidence)
+                        return self.result(url, 'review_required', reason='job success lacks usable matching archive evidence; retained for review')
                     # Indexing can lag. Keep job ID for later runs; do not resubmit.
                 elif obj.get('status') == 'error':
+                    if safe_status_ext(obj.get('status_ext')) == 'unknown':
+                        pending['review_required'] = True
+                        self.save()
+                        return self.result(url, 'review_required', reason='unknown job error; outcome not safe to resubmit')
                     self.state.pop(url, None)
                     self.save()
-                    return self.result(url, 'failed', reason='SPN error', status_ext=obj.get('status_ext', 'unknown'))
+                    return self.result(url, 'failed', reason='SPN error', status_ext=safe_status_ext(obj.get('status_ext')))
                 time.sleep(10)
             return self.result(url, 'pending', reason='job or independent index verification pending')
         except (LookupFailure, ValueError, OSError) as exc:
