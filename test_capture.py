@@ -1104,6 +1104,188 @@ class ResumableQueueTests(unittest.TestCase):
         queue.assert_called_once_with([TRANSPORT_PROBE], 'transport_probe')
         self.assertEqual(TRANSPORT_PROBE, BASE + '/products/date-mod-ice-blue-arabic-watch')
 
+class GlobalArchivePacingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.old = os.getcwd(); os.chdir(self.tmp.name)
+        self.now = 1793600000.0; self.calls = []
+        self.clock = patch('capture.time.time', side_effect=lambda: self.now); self.clock.start()
+        self.sleep = patch('capture.time.sleep', side_effect=self.advance); self.sleep.start()
+        self.c = Client(); self.r = Runner(self.c, 'state.json', budget=10000)
+        self.c._request = Mock(side_effect=self.response)
+    def tearDown(self):
+        self.sleep.stop(); self.clock.stop(); os.chdir(self.old); self.tmp.cleanup()
+    def advance(self, seconds): self.now += seconds
+    def response(self, url, data=None, authenticated=False):
+        self.calls.append((url, data, self.now)); self.now += 5
+        return 200, {}, '{}', url
+    def test_every_request_type_uses_completion_floor(self):
+        urls = ['https://web.archive.org/cdx/search/cdx?x=1',
+                'https://web.archive.org/web/20261102015923id_/' + URL,
+                'https://web.archive.org/save/status/job', 'https://web.archive.org/save/']
+        for index, url in enumerate(urls):
+            self.c.request(url, {'url': URL} if index == 3 else None, index >= 2)
+        self.assertEqual(len(self.calls), 4)
+        self.assertTrue(all(b[2]-a[2] >= 125 for a,b in zip(self.calls,self.calls[1:])))
+        self.assertEqual(self.r.state['_archive_next_request_at'], self.now+120)
+    def test_get_retry_and_failed_connection_share_floor(self):
+        count=0
+        def fail_once(*args):
+            nonlocal count
+            self.calls.append((args[0], None, self.now)); self.now+=5; count+=1
+            if count==1: raise LookupFailure('offline', transport={'phase':'tcp_connect','known_not_sent':True})
+            return 200, {}, '{}', args[0]
+        self.c._request.side_effect=fail_once
+        self.c.request('https://web.archive.org/cdx/search/cdx')
+        self.assertEqual(len(self.calls),2)
+        self.assertGreaterEqual(self.calls[1][2]-self.calls[0][2],125)
+    def test_safe_post_retry_one_only_and_audit_after_wait(self):
+        audit=[]; self.c.post_attempt_callback=lambda row:audit.append(row.copy())
+        def failure(url,*args):
+            self.calls.append((url,None,self.now)); self.now+=5
+            raise LookupFailure('offline',transport={'phase':'tcp_connect','known_not_sent':True})
+        self.c._request.side_effect=failure
+        with self.assertRaises(LookupFailure): self.c.request('https://web.archive.org/save/',{'url':URL},True)
+        self.assertEqual(len(self.calls),2)
+        self.assertGreaterEqual(self.calls[1][2]-self.calls[0][2],125)
+        self.assertEqual([a['started_at'] for a in audit],[x[2] for x in self.calls])
+    def test_read_error_persists_floor_no_post_retry(self):
+        self.c._request.side_effect=LookupFailure('read failed',transport={'phase':'read','known_not_sent':False})
+        with self.assertRaises(LookupFailure):self.c.request('https://web.archive.org/save/',{'url':URL},True)
+        self.assertEqual(self.c._request.call_count,1)
+        self.assertEqual(json.loads(Path('state.json').read_text())['_archive_next_request_at'],self.now+120)
+    def test_any_response_retry_after_extends_persisted_gate(self):
+        self.c._request.return_value=(503,{'Retry-After':'900'},'{}','https://web.archive.org/save/')
+        self.c._request.side_effect=None
+        self.c.request('https://web.archive.org/save/',{'url':URL},True)
+        gate=self.now+900
+        self.assertEqual(self.r.state['_archive_next_request_at'],gate)
+        self.c._request.side_effect=self.response
+        self.c.request('https://web.archive.org/cdx/search/cdx')
+        self.assertGreaterEqual(self.calls[0][2],gate)
+    def test_restarted_runner_does_not_reset_gate(self):
+        self.c.request('https://web.archive.org/cdx/search/cdx')
+        gate=self.r.state['_archive_next_request_at']
+        other=Client(); runner=Runner(other,'state.json',budget=10000)
+        other._request=Mock(side_effect=self.response)
+        other.request('https://web.archive.org/save/status/job',authenticated=True)
+        self.assertGreaterEqual(self.calls[-1][2],gate)
+    def test_budget_failure_no_sleep_no_network_and_not_transport_failure(self):
+        from capture import RequestDeferred
+        self.c.archive_next_request_at=self.now+500
+        self.c.archive_deadline=self.now+400
+        import capture
+        capture.time.sleep.reset_mock()
+        with self.assertRaises(RequestDeferred):self.c.request('https://web.archive.org/cdx/search/cdx')
+        self.c._request.assert_not_called(); capture.time.sleep.assert_not_called()
+        self.assertEqual(self.c.archive_transport_failures,0)
+    def test_oversleep_inside_gate_rechecks_budget_before_io_or_audit(self):
+        from capture import RequestDeferred
+        self.c.archive_next_request_at=self.now+120
+        self.c.archive_deadline=self.now+1000
+        self.c.post_attempt_callback=Mock()
+        with patch('capture.time.sleep',side_effect=lambda n:self.advance(n+1000)):
+            with self.assertRaises(RequestDeferred):self.c.request('https://web.archive.org/save/',{'url':URL},True)
+        self.c._request.assert_not_called();self.c.post_attempt_callback.assert_not_called()
+    def test_storefront_redirect_cannot_enter_archive_outside_gate(self):
+        from capture import NoRedirectIntoArchive
+        import urllib.request
+        handler=NoRedirectIntoArchive();request=urllib.request.Request(BASE+'/old')
+        self.assertIsNone(handler.redirect_request(request,None,302,'',{},'https://web.archive.org/save/status/system'))
+        self.assertIsNone(handler.redirect_request(request,None,302,'',{},'https://archive.org/wayback/available'))
+        redirected=handler.redirect_request(request,None,302,'',{},BASE+'/new')
+        self.assertEqual(redirected.full_url,BASE+'/new')
+
+    def test_post_requires_spaced_verification_reserve(self):
+        from capture import RequestDeferred
+        self.c.archive_deadline=self.now+499
+        with self.assertRaises(RequestDeferred):self.c.request('https://web.archive.org/save/',{'url':URL},True)
+        self.c._request.assert_not_called()
+    def test_new_pending_budget_deferral_not_permanent_unknown(self):
+        self.c.verify=Mock(return_value=None)
+        self.c.archive_deadline=self.now+300
+        row=self.r.process(URL)
+        self.assertEqual(row['state'],'deferred');self.assertTrue(row['queue_untouched'])
+        self.assertNotIn(URL,self.r.state);self.c._request.assert_not_called()
+        self.assertEqual(self.r.state['_completed_jobs'][-1]['state'],'budget_not_submitted')
+    def test_after_actual_post_budget_deferral_keeps_job_and_no_duplicate(self):
+        self.c.verify=Mock(return_value=None)
+        self.c.archive_deadline=self.now+600
+        def accepted(url,*args):
+            self.calls.append((url,args,self.now));self.now+=480
+            return 200,{},'{"job_id":"accepted"}',url
+        self.c._request.side_effect=accepted
+        row=self.r.process(URL)
+        self.assertEqual(row['state'],'pending')
+        self.assertEqual(self.r.state[URL]['job_id'],'accepted')
+        self.assertEqual(self.c._request.call_count,1)
+    def test_historical_unknowns_are_unchanged(self):
+        self.c.verify=Mock(return_value=None)
+        for i in range(11):self.r.state[BASE+'/old-'+str(i)]={'job_id':None,'submitted_at':self.now-1000}
+        before=json.loads(json.dumps(self.r.state))
+        for url in before:self.r.process(url)
+        for url in before:self.assertEqual(self.r.state[url],before[url])
+        self.c._request.assert_not_called()
+    def test_safe_first_post_budget_prevents_retry_and_retains_proof(self):
+        self.c.verify=Mock(return_value=None)
+        self.c.archive_deadline=self.now+600
+        self.c.post_retry_deadline=self.now+600
+        self.c._request.side_effect=LookupFailure('refused',transport={'phase':'tcp_connect','known_not_sent':True})
+        row=self.r.process(URL)
+        self.assertEqual(self.c._request.call_count,1)
+        self.assertTrue(self.r.state[URL]['known_not_sent'])
+        self.assertEqual(row['state'],'unverified')
+    def test_retry_gate_recheck_preserves_proof_after_unexpected_clock_delay(self):
+        self.c.verify=Mock(return_value=None)
+        self.c.archive_deadline=self.now+1000
+        self.c.post_retry_deadline=self.now+1000
+        self.c._request.side_effect=LookupFailure('refused',transport={'phase':'tcp_connect','known_not_sent':True})
+        def oversleep(seconds):self.now+=seconds+(1000 if seconds>0 else 0)
+        with patch('capture.time.sleep',side_effect=oversleep):row=self.r.process(URL)
+        self.assertEqual(self.c._request.call_count,1)
+        self.assertTrue(self.r.state[URL]['known_not_sent'])
+    def test_retry_after_headers_survive_body_read_failure(self):
+        from unittest.mock import MagicMock
+        response=MagicMock();response.__enter__.return_value=response
+        response.status=503;response.headers={'Retry-After':'900'}
+        response.read.side_effect=TimeoutError('SECRET read timeout')
+        opener=Mock();opener.open.return_value=response
+        self.c._request=Client._request.__get__(self.c)
+        with patch('capture.ur.build_opener',return_value=opener):
+            with self.assertRaises(LookupFailure):self.c.paced_request('https://web.archive.org/cdx/search/cdx')
+        self.assertGreaterEqual(self.r.state['_archive_next_request_at'],self.now+900)
+        self.assertNotIn('SECRET',Path('state.json').read_text())
+    def test_old_saved_host_cooldown_is_respected_on_restart(self):
+        self.r.state['_next_submit']=self.now+900;self.r.save()
+        other=Client();runner=Runner(other,'state.json',budget=10000)
+        other._request=Mock(side_effect=self.response)
+        other.request('https://web.archive.org/cdx/search/cdx')
+        self.assertGreaterEqual(self.calls[0][2],1793600900)
+
+    def test_health_requests_obey_same_gate(self):
+        def health(url,*args):
+            self.calls.append((url,None,self.now));self.now+=5
+            return 200,{},'{}' if '/save/status/' in url else '[]',url
+        self.c._request.side_effect=health
+        self.assertTrue(self.r.recover_transport(cycle=1))
+        self.assertEqual(len(self.calls),4)
+        self.assertTrue(all(b[2]-a[2]>=125 for a,b in zip(self.calls,self.calls[1:])))
+    def test_pacing_save_failure_prevents_actual_io(self):
+        self.c.archive_pacing_callback=Mock(side_effect=OSError('save failed'))
+        with self.assertRaises(OSError):self.c.request('https://web.archive.org/cdx/search/cdx')
+        self.c._request.assert_not_called()
+    def test_storefront_requests_not_delayed_by_archive_gate(self):
+        self.c.archive_next_request_at=self.now+1000
+        start=self.now;self.c.request(BASE+'/collections/all')
+        self.assertEqual(self.calls[0][2],start)
+    def test_new_canary_scope_is_fixed_and_budget_capped(self):
+        from capture import main,PACING_PROBE
+        with patch('sys.argv',['capture.py','--scope','pacing_probe']),patch('capture.Runner') as runner,patch.dict(os.environ,{'GITHUB_STEP_SUMMARY':''}):
+            runner.return_value.results=[]
+            main()
+        self.assertEqual(runner.call_args.args[2],1800)
+        runner.return_value.run_queue.assert_called_once_with([PACING_PROBE],'pacing_probe')
+        self.assertEqual(PACING_PROBE,BASE+'/products/date-mod-olive-green-watch')
+
 class WorkflowTests(unittest.TestCase):
     def test_operational_artifact_is_explicit_and_tests_are_isolated(self):
         workflow = (Path(__file__).resolve().parent / '.github/workflows/wayback-snapshot.yml').read_text()

@@ -22,6 +22,7 @@ PRIORITY = ['/', '/policies/refund-policy', '/policies/shipping-policy',
  '/pages/warranty-policy', '/pages/no-brand-affiliation',
  '/policies/subscription-policy', '/cart', '/cart/51183558787357:1?storefront=true']
 TRANSPORT_PROBE = BASE + '/products/date-mod-ice-blue-arabic-watch'
+PACING_PROBE = BASE + '/products/date-mod-olive-green-watch'
 UTC = dt.timezone.utc
 
 def timestamp(epoch):
@@ -110,7 +111,7 @@ def operational_summary(state):
     for key, queue in queue_map.items():
         if not isinstance(key, str) or not isinstance(queue, dict):
             continue
-        if not re.fullmatch(r'(all|priority|pilot|supplemental|transport_probe):[0-9]{8}:(capture|poll|verify)', key):
+        if not re.fullmatch(r'(all|priority|pilot|supplemental|transport_probe|pacing_probe):[0-9]{8}:(capture|poll|verify)', key):
             continue
         urls = queue.get('urls', [])
         total = len(urls) if isinstance(urls, list) else 0
@@ -140,6 +141,7 @@ def operational_summary(state):
                                'known_not_sent': sum(p.get('known_not_sent') is True for p in pending)},
             'transport_cooldown_until': safe_time('_transport_cooldown_until'),
             'next_submit_at': safe_time('_next_submit'),
+            'archive_next_request_at': safe_time('_archive_next_request_at'),
             'recovery_events': [safe_recovery_event(e) for e in events[-100:] if isinstance(e, dict)],
             'coverage_note': 'Queue progress and health probes are not capture coverage.'}
 
@@ -147,6 +149,10 @@ class LookupFailure(Exception):
     def __init__(self, message, transport=None):
         super().__init__(message)
         self.transport = transport
+
+
+class RequestDeferred(LookupFailure):
+    """No request was started: insufficient pacing/verification budget."""
 
 
 class TrackedHTTPSConnection(http.client.HTTPSConnection):
@@ -184,6 +190,13 @@ class NoRedirect(ur.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None  # Never forward Archive authorization to a redirect destination.
 
+class NoRedirectIntoArchive(ur.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if up.urlsplit(newurl).hostname in ('web.archive.org', 'archive.org'):
+            return None  # Do not enter Archive via an ungated storefront redirect.
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class Client:
     def __init__(self):
         self.archive_transport_failures = 0
@@ -191,36 +204,81 @@ class Client:
         self.post_retry_deadline = 0  # Runner grants a bounded remaining budget.
         self.post_retry_not_before = 0
         self.post_attempt_callback = None
+        self.archive_interval = 0  # Runner binds the persisted production gate.
+        self.archive_next_request_at = 0
+        self.archive_deadline = float('inf')
+        self.archive_pacing_callback = None
+
+    def paced_request(self, url, data=None, authenticated=False, attempt=1):
+        is_archive = up.urlsplit(url).hostname in ('web.archive.org', 'archive.org')
+        gated = is_archive and self.archive_interval > 0
+        if gated:
+            # POST needs room for status, CDX and replay, each behind the same
+            # gate. This is a minimum useful reserve, not a success guarantee.
+            reserve = 4 * 35 + 3 * self.archive_interval if data is not None else 35
+            ready = max(time.time(), self.archive_next_request_at)
+            if ready + reserve >= self.archive_deadline:
+                raise RequestDeferred('Archive pacing/verification time budget')
+            time.sleep(max(0, ready - time.time()))
+            if time.time() + reserve >= self.archive_deadline:
+                raise RequestDeferred('Archive pacing budget elapsed while waiting')
+            self.archive_next_request_at = time.time() + self.archive_interval
+            if self.archive_pacing_callback:
+                self.archive_pacing_callback(self.archive_next_request_at)
+        # Timestamp/audit must follow pacing and precede actual network IO.
+        if data is not None and self.post_attempt_callback is not None:
+            self.post_attempt_callback({'attempt': attempt, 'started_at': time.time()})
+        response = None
+        self.archive_observed_retry_after = 0
+        try:
+            response = self._request(url) if data is None and not authenticated else self._request(url, data, authenticated)
+            return response
+        finally:
+            if gated:
+                until = max(time.time() + self.archive_interval, self.archive_observed_retry_after)
+                if response is not None:
+                    headers = {k.lower(): v for k, v in response[1].items()}
+                    until = max(until, response_metadata(response[0], headers, {}).get('retry_after_until', 0))
+                self.archive_next_request_at = max(self.archive_next_request_at, until)
+                if self.archive_pacing_callback:
+                    self.archive_pacing_callback(self.archive_next_request_at)
 
     def request(self, url, data=None, authenticated=False):
         is_archive = up.urlsplit(url).hostname == 'web.archive.org'
+        last_safe_failure = None
         for attempt in range(2):
-            if data is not None and self.post_attempt_callback is not None:
-                self.post_attempt_callback({'attempt': attempt + 1, 'started_at': time.time()})
-            if data is None and is_archive:
+            if data is None and is_archive and not self.archive_interval:
                 wait = max(0, getattr(self, '_last_read', 0) + 2 - time.time())
                 if wait:
                     time.sleep(wait)
                 self._last_read = time.time()
             try:
-                response = self._request(url, data, authenticated)
+                response = self.paced_request(url, data, authenticated, attempt=attempt + 1)
                 if data is None and not authenticated and response[0] in (429, 502, 503, 504) and attempt == 0:
-                    time.sleep(30)
+                    if not (is_archive and self.archive_interval):
+                        time.sleep(30)
                     continue
                 if is_archive and 200 <= response[0] < 400:
                     self.archive_healthy_responses += 1
                 return response
+            except RequestDeferred:
+                if last_safe_failure is not None:
+                    raise last_safe_failure  # No second dispatch: retain first proof.
+                raise  # Never turn a local budget decision into another attempt.
             except LookupFailure as exc:
                 if data is not None:
                     proof = exc.transport or {}
-                    wait = max(60, self.post_retry_not_before - time.time())
+                    wait = max(60, self.post_retry_not_before - time.time(), self.archive_next_request_at - time.time())
+                    reserve = 4 * 35 + 3 * self.archive_interval if self.archive_interval else 35
                     may_retry = (attempt == 0 and proof.get('known_not_sent') is True
-                                 and time.time() + wait + 35 < self.post_retry_deadline)
+                                 and time.time() + wait + reserve < self.post_retry_deadline)
                     if may_retry:
+                        last_safe_failure = exc
                         time.sleep(wait)
                         continue
                 elif attempt == 0:
-                    time.sleep(10)
+                    if not (is_archive and self.archive_interval):
+                        time.sleep(10)
                     continue
                 if is_archive and exc.transport:
                     # Count the exhausted logical request, not its retry attempts.
@@ -243,8 +301,10 @@ class Client:
         req = ur.Request(url, data=up.urlencode(data).encode() if data else None, headers=headers)
         tracker = {'tcp_connect_attempted': False, 'tcp_connect_failed': False, 'tcp_established': False}
         handlers = [TrackedHTTPSHandler(tracker)]
-        if authenticated:
-            handlers.append(NoRedirect())
+        if authenticated or up.urlsplit(url).hostname in ('web.archive.org', 'archive.org'):
+            handlers.append(NoRedirect())  # No hidden redirect requests outside the global gate.
+        else:
+            handlers.append(NoRedirectIntoArchive())
         phase = 'open'
         try:
             try:
@@ -252,6 +312,9 @@ class Client:
             except urllib.error.HTTPError as exc:
                 response = exc
             with response:
+                if up.urlsplit(url).hostname in ('web.archive.org', 'archive.org'):
+                    safe_headers = {k.lower(): v for k, v in response.headers.items()}
+                    self.archive_observed_retry_after = response_metadata(response.status, safe_headers, {}).get('retry_after_until', 0)
                 phase = 'read'
                 body = response.read(8 * 1024 * 1024 + 1)
                 if len(body) > 8 * 1024 * 1024:
@@ -441,6 +504,14 @@ class Runner:
         self.transport_failure_streak = 0
         self.transport_circuit_open = False
         self.client.post_retry_deadline = self.deadline
+        self.client.archive_interval = 120
+        self.client.archive_next_request_at = max(self.state.get('_archive_next_request_at', 0),
+                                                 self.state.get('_transport_cooldown_until', 0), self.state.get('_next_submit', 0))
+        self.client.archive_deadline = self.deadline
+        def persist_archive_gate(until):
+            self.state['_archive_next_request_at'] = until
+            self.save()
+        self.client.archive_pacing_callback = persist_archive_gate
 
     def save(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -530,6 +601,9 @@ class Runner:
                 seconds = 660
         self.next_submit = time.time() + max(660, seconds)
         self.state['_next_submit'] = self.next_submit
+        # A known server pause is stronger than the local global floor.
+        self.client.archive_next_request_at = max(self.state.get('_archive_next_request_at', 0), self.next_submit)
+        self.state['_archive_next_request_at'] = self.client.archive_next_request_at
         self.save()
         return True
 
@@ -596,9 +670,9 @@ class Runner:
 
     def recover_transport(self, cycle=0):
         """Bounded public GET-only health gate, not proof of capture coverage."""
-        until = max(self.state.get('_transport_cooldown_until', 0), self.next_submit)
+        until = max(self.state.get('_transport_cooldown_until', 0), self.next_submit, self.state.get('_archive_next_request_at', 0))
         # Estimated reserve; socket timeouts are not a hard wall-clock limit.
-        if time.time() + max(0, until - time.time()) + 210 >= self.deadline:
+        if time.time() + max(0, until - time.time()) + 620 >= self.deadline:
             self.recovery_event('budget_exhausted', cycle, healthy=False, cooldown_until=until)
             return False
         self.recovery_event('waiting', cycle, cooldown_until=until)
@@ -618,7 +692,7 @@ class Runner:
                 try:
                     # Bypass retry orchestration, NOT proxy/TLS: one normal
                     # unauthenticated GET per endpoint/pass, no credentials.
-                    code, headers, body, final = self.client._request(endpoint)
+                    code, headers, body, final = self.client.paced_request(endpoint)
                     metadata = response_metadata(code, {k.lower(): v for k, v in headers.items()}, {})
                     retry_until = metadata.get('retry_after_until', 0)
                     detail['http_status'] = code
@@ -627,6 +701,9 @@ class Runner:
                         detail['retry_after_until'] = retry_until
                     detail['body_schema_matches'] = isinstance(json.loads(body), expected)
                     healthy = code == 200 and final == endpoint and detail['body_schema_matches']
+                except RequestDeferred:
+                    self.recovery_event('budget_exhausted', cycle, healthy=False, cooldown_until=until)
+                    return False
                 except (LookupFailure, ValueError, TypeError) as exc:
                     healthy = False
                     detail['error_class'] = type(exc).__name__
@@ -684,7 +761,7 @@ class Runner:
                     break
                 cycles += 1
                 if not self.recover_transport(cycle=cycles):
-                    if time.time() + 1110 >= self.deadline:
+                    if time.time() + 1520 >= self.deadline:
                         break
                     continue
             url = queue['urls'][queue['cursor']]
@@ -869,6 +946,14 @@ class Runner:
                     return self.result(url, 'review_required', reason='job reported error; no usable indexed capture yet, no automatic resubmission')
                 time.sleep(10)
             return self.result(url, 'pending', reason='job or independent index verification pending')
+        except RequestDeferred:
+            pending = self.state.get(url, {})
+            attempted = bool(pending.get('request_evidence', {}).get('attempts'))
+            if created_pending and not attempted:
+                self.retire_pending(url, 'budget_not_submitted')
+            if created_pending and attempted:
+                return self.result(url, 'pending', reason='pacing budget ended after submission; job retained')
+            return self.result(url, 'deferred', reason='Archive pacing/time budget; untouched queue retained', queue_untouched=True)
         except (LookupFailure, ValueError, OSError) as exc:
             detail = getattr(exc, 'transport', None)
             if detail:
@@ -889,7 +974,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--verify-only', action='store_true')
     mode.add_argument('--poll-only', action='store_true', help='Read existing job status and archive evidence; never submit')
-    parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental', 'transport_probe'), default='all')
+    parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental', 'transport_probe', 'pacing_probe'), default='all')
     parser.add_argument('--state', default='.capture-state/pending.json')
     mode.add_argument('--inspect-state', action='store_true', help='Emit sanitized saved-state summary only; no network or state mutation')
     parser.add_argument('--budget', type=int, default=17400)
@@ -905,10 +990,13 @@ def main():
         print(json.dumps(summary), flush=True)
         return 0
     client = Client()
-    runner = Runner(client, args.state, args.budget, verify_only=args.verify_only, poll_only=args.poll_only)
+    budget = min(args.budget, 1800) if args.scope == 'pacing_probe' else args.budget
+    runner = Runner(client, args.state, budget, verify_only=args.verify_only, poll_only=args.poll_only)
     urls = [] if args.scope == 'supplemental' else [BASE + p for p in (['/pages/warranty-policy'] if args.scope == 'pilot' else PRIORITY)]
     if args.scope == 'transport_probe':
         urls = [TRANSPORT_PROBE]
+    if args.scope == 'pacing_probe':
+        urls = [PACING_PROBE]
     if args.scope == 'supplemental':
         try:
             urls = discover_supplemental(client)

@@ -16,7 +16,7 @@ Recover a saved job without submitting: `python capture.py --poll-only --scope p
 
 Manual Actions runs default to read-only and the one-page warranty pilot. Set verify_only=false only after any other manual capture queue is finished. Choose priority or all for broader runs. Existing repository secrets are consumed only inside Actions; do not copy keys locally.
 
-Submissions are at least 60 seconds apart. Each dispatch has at most one logical submission per URL; a pilot never resubmits after an HTTP/host refusal. The narrowly proven TCP-not-sent case below permits one physical connection retry, not a second potentially accepted capture. Host-paused/429 responses cause a persisted host-wide cooldown of at least 11 minutes (or longer Retry-After). A POST with an uncertain outcome is preserved and not automatically duplicated. Pending job IDs are cached across runs and rechecked. Success responses are resolved with independent archive evidence: proven prior-day reuse becomes terminal `reused` under the next-day policy below; missing/malformed timestamps, mismatched URLs and otherwise unknown outcomes remain `review_required`. Job ID, submission time, safe request/response diagnostics and parsed Retry-After are retained; none triggers an automatic duplicate submission in the same run. A throttled status lookup retains the accepted job and its cooldown rather than treating it as a refused submission. Arbitrary response bodies, headers, and unknown returned URLs are not retained. Cache loss/eviction is possible; review unresolved records before manually restarting. Failed status/index checks remain visible rather than being described as successful.
+Production Archive requests now share the candidate120-second completion-based global gate described below; this also spaces submissions. Each dispatch has at most one logical submission per URL; a pilot never resubmits after an HTTP/host refusal. The narrowly proven TCP-not-sent case below permits one physical connection retry, not a second potentially accepted capture. Host-paused/429 responses cause a persisted host-wide cooldown of at least 11 minutes (or longer Retry-After). A POST with an uncertain outcome is preserved and not automatically duplicated. Pending job IDs are cached across runs and rechecked. Success responses are resolved with independent archive evidence: proven prior-day reuse becomes terminal `reused` under the next-day policy below; missing/malformed timestamps, mismatched URLs and otherwise unknown outcomes remain `review_required`. Job ID, submission time, safe request/response diagnostics and parsed Retry-After are retained; none triggers an automatic duplicate submission in the same run. A throttled status lookup retains the accepted job and its cooldown rather than treating it as a refused submission. Arbitrary response bodies, headers, and unknown returned URLs are not retained. Cache loss/eviction is possible; review unresolved records before manually restarting. Failed status/index checks remain visible rather than being described as successful.
 
 An accepted job can take longer than this run's polling window. Pending indexing is rechecked on the next run without a new POST. If an uncertain submission has no job ID and never appears in CDX, it requires review of the saved state before retrying; do not automatically clear it. CDX errors mean unknown, not absence. Historic index gaps cannot be repaired by captures made today.
 
@@ -124,3 +124,46 @@ summary without instantiating a network client, submitting/polling, modifying
 saved state or reading credentials. It writes only `operational-report.json`.
 Offline workflow tests run in a temporary working directory so test-generated
 reports cannot be mistaken for real-run evidence.
+
+### Candidate global Archive pacing (not a demonstrated connectivity fix)
+
+Every production Archive request passes through one persisted gate: CDX, exact
+replay, status, submission, health checks and existing bounded retries. The next
+request starts at least120seconds after the previous attempt **finishes**, even
+when it fails. Longer server Retry-After and restored host/transport cooldowns
+win. Retry-After is captured before reading a body, so a body timeout cannot erase
+an already-received server cooldown. Archive redirects are not followed: they
+would otherwise create hidden requests outside this gate. Storefront discovery
+is not subject to the Archive gate. Standalone offline Client unit fixtures are
+ungated; the production Runner always binds the persisted120-second gate.
+
+`_archive_next_request_at` is checkpointed before IO and after completion/error,
+and exported in operational-report.json. A restarted scope restores it rather
+than bursting immediately. The pre-IO reservation protects interrupted attempts;
+existing pending/unknown jobs remain protected. No additional retries were added.
+The narrow proven TCP-not-sent retry still runs at most once and honors this gate.
+If its retry cannot fit the budget, the original proven-not-sent state survives;
+it does not turn into a permanently unknown submission.
+
+Budget decisions happen before sleeping/IO. A POST requires at least500seconds
+of remaining budget after its gate opens (POST plus spaced status/CDX/replay
+reserve); this reserves a useful verification opportunity, not a guarantee of
+completion. Four health requests reserve620seconds including useful follow-up
+room. If the budget is inadequate, untouched queue work remains checkpointed;
+a submission that already happened stays pending. HTTP/socket timeouts remain
+per-operation estimates rather than hard whole-operation deadlines.
+
+`--scope pacing_probe` selects only the previously untouched
+`https://somervillewatchco.com/products/date-mod-olive-green-watch`, with a maximum
+30-minute budget. It does not redefine the earlier Ice Blue transport probe, and
+an unexpected saved pending job is still protected from another POST. Existing
+cooldowns may consume the canary budget; that is an incomplete/deferred result,
+not permission to skip the cooldown.
+
+This candidate drastically limits throughput. Even already-archived194-page
+coverage requiring CDX+replay would need roughly13hours at this floor; new capture
+verification typically needs more requests. The current290-minute budget cannot
+establish complete daily194-page coverage at that rate. Queue resumption prevents
+abandonment, but does not make the daily goal feasible or justify reporting success.
+Earlier120-second diagnostics also failed, so pacing is not yet proven to fix the
+intermittent network problem.
