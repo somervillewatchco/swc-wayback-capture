@@ -87,3 +87,22 @@ checkpoints, so a probe/recovery run cannot overwrite an all-scope cursor.
 `--scope transport_probe` selects only the fixed, previously untouched product
 `https://somervillewatchco.com/products/date-mod-ice-blue-arabic-watch` for a scoped
 live transport test. It does not change the warranty pilot or scheduled scopes.
+
+### Status errors can conflict with a real capture
+
+An accepted job's error status (including recognized `error:bad-request`) is not
+proof that no capture exists. The runner preserves the job and safe response
+metadata, then checks current-day CDX and exact usable replay. Verified evidence
+wins, with `status_conflict: true`; `new_capture` is true only when its timestamp
+is at least the stored submission time minus five seconds. If evidence is absent
+or unavailable, the job remains protected for review without automatic status
+polling or resubmission. Later runs still check daily evidence to reconcile an
+indexing delay, while continuing unrelated URLs.
+
+All removal paths snapshot allowlisted diagnostics before clearing pending state:
+verified captures, explicit no-job submission refusals, host-paused refusals,
+proven-not-sent releases, and reviewed prior-day reuse releases. A bounded
+50-entry completed audit retains these transitions. A paused response containing
+an accepted job ID retains that job instead. Arbitrary raw messages, response URLs,
+headers and secrets are never stored. This improves future evidence; it cannot
+recover a response or job ID discarded by an older deployed version.

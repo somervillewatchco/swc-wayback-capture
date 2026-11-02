@@ -174,6 +174,91 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.r.process(URL)['state'], 'failed')
         self.assertNotIn(URL, self.r.state)
 
+    def test_terminal_error_retained_then_later_index_reconciles_without_post(self):
+        self.c.json.side_effect = [(200, {}, {'job_id': 'accepted-job'}),
+            (200, {}, {'status': 'error', 'status_ext': 'error:bad-request',
+                       'message': 'SECRET raw server failure', 'url': 'https://private/SECRET'})]
+        row = self.r.process(URL)
+        self.assertEqual(row['state'], 'review_required')
+        self.assertEqual(row['job_id'], 'accepted-job')
+        self.assertIn('submitted_at', row)
+        self.assertEqual(row['request_evidence']['if_not_archived_within'], '1')
+        self.assertEqual(row['submission_response']['http_status'], 200)
+        self.assertEqual(row['status_response']['status_ext'], 'error:bad-request')
+        saved = json.loads(Path('state.json').read_text())
+        self.assertIn(URL, saved)
+        self.assertNotIn('SECRET', json.dumps(saved) + json.dumps(row))
+        self.assertEqual(self.c.json.call_count, 2)
+        other = Runner(self.c, 'state.json')
+        self.assertEqual(other.process(URL)['state'], 'review_required')
+        self.assertEqual(self.c.json.call_count, 2)
+        self.c.verify.return_value = {'timestamp': timestamp(time.time()), 'replay': 'verified-replay'}
+        row = other.process(URL)
+        self.assertEqual(row['state'], 'verified')
+        self.assertTrue(row['status_conflict'])
+        self.assertTrue(row['new_capture'])
+        self.assertEqual(row['job_id'], 'accepted-job')
+        self.assertNotIn(URL, other.state)
+        self.assertEqual(other.state['_completed_jobs'][-1]['status_response']['status_ext'], 'error:bad-request')
+        self.assertEqual(self.c.json.call_count, 2)
+    def test_status_error_immediately_reconciles_exact_verified_evidence(self):
+        self.c.json.side_effect = [(200, {}, {'job_id': 'accepted-job'}),
+            (200, {}, {'status': 'error', 'status_ext': 'error:bad-request'})]
+        self.c.verify.side_effect = [None, {'timestamp': timestamp(time.time()), 'replay': 'verified-replay'}]
+        row = self.r.process(URL)
+        self.assertEqual(row['state'], 'verified')
+        self.assertEqual(row['coverage_source'], 'status_error_reconciled_index')
+        self.assertTrue(row['status_conflict'])
+        self.assertEqual(row['job_id'], 'accepted-job')
+        self.assertNotIn(URL, self.r.state)
+        self.assertEqual(self.c.json.call_count, 2)
+    def test_status_error_index_lookup_failure_preserves_job(self):
+        self.c.json.side_effect = [(200, {}, {'job_id': 'accepted-job'}),
+            (200, {}, {'status': 'error', 'status_ext': 'error:bad-request'})]
+        self.c.verify.side_effect = [None, LookupFailure('CDX unavailable')]
+        self.assertEqual(self.r.process(URL)['state'], 'unverified')
+        self.assertTrue(self.r.state[URL]['review_required'])
+        self.assertTrue(self.r.state[URL]['status_error'])
+        self.assertEqual(self.r.state[URL]['job_id'], 'accepted-job')
+    def test_preexisting_daily_capture_not_labeled_new_and_retains_diagnostics(self):
+        self.r.state[URL] = {'submitted_at': time.time(), 'job_id': 'accepted-job',
+                            'status_response': {'status_ext': 'error:bad-request'}, 'status_error': True}
+        self.c.verify.return_value = {'timestamp': timestamp(time.time()-120), 'replay': 'verified-replay'}
+        row = self.r.process(URL)
+        self.assertFalse(row['new_capture'])
+        self.assertEqual(row['job_id'], 'accepted-job')
+        self.assertEqual(row['status_response']['status_ext'], 'error:bad-request')
+    def test_submission_host_pause_audits_before_clear(self):
+        self.c.json.return_value = (429, {'retry-after': '660'}, {'status_ext': 'error:host-crawling-paused'})
+        row = self.r.process(URL)
+        self.assertEqual(row['state'], 'deferred')
+        self.assertIn('request_evidence', row)
+        self.assertEqual(row['submission_response']['http_status'], 429)
+        self.assertNotIn(URL, self.r.state)
+        self.assertEqual(self.r.state['_completed_jobs'][-1]['submission_response'], row['submission_response'])
+    def test_submission_pause_with_accepted_job_never_clears(self):
+        self.c.json.return_value = (429, {'retry-after': '660'}, {'job_id': 'accepted-job', 'status_ext': 'error:host-crawling-paused'})
+        row = self.r.process(URL)
+        self.assertEqual(row['job_id'], 'accepted-job')
+        self.assertEqual(self.r.state[URL]['job_id'], 'accepted-job')
+        self.assertEqual(self.c.json.call_count, 1)
+
+    def test_terminal_failure_audit_is_bounded_and_excludes_arbitrary_state(self):
+        self.r.state['_completed_jobs'] = [{'old': i} for i in range(50)]
+        self.r.state[URL] = {'job_id': 'accepted-job', 'submitted_at': time.time(), 'raw_secret': 'SECRET'}
+        self.r.terminal_failure(URL, reason='SPN error', status_ext='error:bad-request')
+        self.assertEqual(len(self.r.state['_completed_jobs']), 50)
+        self.assertEqual(self.r.state['_completed_jobs'][0], {'old': 1})
+        self.assertNotIn('SECRET', json.dumps(self.r.state['_completed_jobs']))
+    def test_rejected_submission_retains_request_audit_without_job(self):
+        self.c.json.return_value = (401, {}, {'status': 'error', 'message': 'SECRET'})
+        row = self.r.process(URL)
+        self.assertIn('request_evidence', row)
+        self.assertNotIn('job_id', row)
+        self.assertNotIn(URL, self.r.state)
+        self.assertEqual(self.r.state['_completed_jobs'][-1]['http_status'], 401)
+        self.assertNotIn('SECRET', json.dumps(self.r.state))
+
     def test_missing_original_url_is_not_success(self):
         self.c.json.side_effect = [(200, {}, {'job_id':'job'}),
             (200, {}, {'status':'success','timestamp':timestamp(time.time())})]
