@@ -38,6 +38,60 @@ class VerificationTests(unittest.TestCase):
         c.request = Mock(return_value=(200, {'Content-Type': 'text/html'}, body, final or replay))
         return c
 
+    def test_challenge_heading_with_store_title_rejected(self):
+        body = GOOD.replace('<body>', '<body><h1>Verify <span>you are</span> human</h1>')
+        self.assertFalse(usable_html(body, URL))
+        self.assertIsNone(self.client(body=body).verify(URL, time.time()-60))
+
+    def test_embedded_challenge_text_is_not_a_document_challenge(self):
+        body = GOOD.replace('<body>', '<body><script>"<h1>Verify you are human</h1>"</script>'
+            '<!-- <h1>Robot check</h1> --><div class="h-captcha"></div>')
+        self.assertTrue(usable_html(body, URL))
+
+    def test_exact_challenge_prompt_variants_rejected(self):
+        prompts = ('Verify you are a human', 'Verify that you are a human',
+                   'Please verify you are human to continue', 'Verify you are not a robot',
+                   'Security verification', 'Checking your browser', 'Bot verification')
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                self.assertFalse(usable_html(GOOD.replace('<body>', '<body><h2>'+prompt+'</h2>'), URL))
+
+    def test_nested_entity_encoded_challenge_heading_rejected(self):
+        body = GOOD.replace('<body>', '<body><h2>Ver<span>ify</span>&nbsp;that you are '
+            '<strong>a</strong> human&#33;</h2>')
+        self.assertFalse(usable_html(body, URL))
+
+    def test_inert_markup_challenge_headings_ignored(self):
+        fixtures = ('<template><h1>Bot verification</h1></template>',
+                    '<template><template><h1>Verify you are human</h1></template></template>',
+                    '<script>"<h1>Checking your browser</h1>"</script>',
+                    '<style>/* <h1>Security verification</h1> */</style>',
+                    '<!-- <h1>Verify you are a human</h1> -->')
+        for fixture in fixtures:
+            with self.subTest(fixture=fixture):
+                self.assertTrue(usable_html(GOOD.replace('<body>', '<body>'+fixture), URL))
+
+    def test_real_heading_after_inert_markup_rejected(self):
+        body = GOOD.replace('<body>', '<body><template><h1>Watch guide</h1></template>'
+            '<h1>Bot verification</h1>')
+        self.assertFalse(usable_html(body, URL))
+
+    def test_normal_craftsmanship_and_security_prose_accepted(self):
+        body = GOOD.replace('<body>', '<body><h1>Human craftsmanship</h1>'
+            '<h2>How we verify you are human</h2><p>Our security policy uses bot verification '
+            'to protect forms. Each watch is assembled by a human.</p>')
+        self.assertTrue(usable_html(body, URL))
+
+    def test_ordinary_captcha_widget_accepted(self):
+        body = GOOD.replace('<body>', '<body><form><div class="h-captcha"></div>'
+            '<script src="https://js.hcaptcha.com/1/api.js"></script></form>')
+        self.assertTrue(usable_html(body, URL))
+
+    def test_challenge_form_without_instruction_accepted(self):
+        body = GOOD.replace('<body>', '<body><form action="/challenge/verify">'
+            '<input name="contact"></form>')
+        self.assertTrue(usable_html(body, URL))
+
     def test_real_html_verified(self):
         self.assertEqual(self.client().verify(URL, time.time()-60)['statuscode'], '200')
 
@@ -1570,6 +1624,27 @@ class OutlinkBatchTests(unittest.TestCase):
         held=self.r.process(self.second)
         self.assertEqual(held['state'],'outlink-held');self.assertEqual(self.physical_posts,1)
         self.c.json.assert_not_called()
+    def test_unknown_expansion_allows_existing_job_read_only_reconciliation(self):
+        self.r.state['_outlink_batches'] = {self.root: {
+            'post_state': 'outcome_unknown', 'expansion_state': 'unknown'}}
+        self.r.state[self.second] = {'job_id': 'saved-child', 'submitted_at': time.time()-300}
+        self.c.json.return_value = (404, {}, {})
+        row = self.r.process(self.second)
+        self.assertEqual(row['state'], 'review_required')
+        self.c.json.assert_called_once_with(
+            'https://web.archive.org/save/status/saved-child', authenticated=True)
+        self.c.paced_request.assert_not_called()
+        self.assertEqual(self.r.state[self.second]['job_id'], 'saved-child')
+        self.assertEqual(self.r.state['_outlink_batches'][self.root]['post_state'], 'outcome_unknown')
+
+    def test_unknown_expansion_verify_only_does_not_report_submission_hold(self):
+        self.r.state['_outlink_batches'] = {self.root: {
+            'post_state': 'outcome_unknown', 'expansion_state': 'unknown'}}
+        self.r.verify_only = True
+        self.assertEqual(self.r.process(self.second)['state'], 'unverified')
+        self.c.json.assert_not_called()
+        self.c.paced_request.assert_not_called()
+
     def test_known_unverified_child_holds_direct_post_but_verified_child_resolves(self):
         self.r.run_outlink_probe()
         self.assertIn('unresolved outlink child',self.r.outlink_submission_hold(self.product))

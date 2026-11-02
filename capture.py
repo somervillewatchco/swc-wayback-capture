@@ -5,6 +5,7 @@ import datetime as dt
 import gzip
 import hashlib
 import html
+from html.parser import HTMLParser
 import http.client
 import json
 import os
@@ -515,11 +516,69 @@ class Client:
             return {**row, 'replay_url': replay, 'verified_at': timestamp(time.time())}
         return None
 
+class ChallengeHeadings(HTMLParser):
+    """Extract document headings, excluding inert markup; not a CSS renderer."""
+    IGNORED = frozenset(('script', 'style', 'template'))
+    HEADINGS = frozenset(('h1', 'h2', 'h3', 'h4', 'h5', 'h6'))
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.ignored = []
+        self.heading = None
+        self.parts = []
+        self.headings = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.IGNORED:
+            self.ignored.append(tag)
+        if self.ignored:
+            return
+        if tag in self.HEADINGS:
+            self.finish_heading()
+            self.heading = tag
+        elif tag == 'br' and self.heading:
+            self.parts.append(' ')
+
+    def handle_endtag(self, tag):
+        if self.ignored:
+            if tag == self.ignored[-1]:
+                self.ignored.pop()
+            return
+        if tag in self.HEADINGS:
+            self.finish_heading()
+
+    def handle_data(self, data):
+        if not self.ignored and self.heading:
+            self.parts.append(data)
+
+    def finish_heading(self):
+        if self.heading:
+            self.headings.append(' '.join(''.join(self.parts).split()))
+        self.heading, self.parts = None, []
+
+
+def has_challenge_heading(body):
+    parser = ChallengeHeadings()
+    parser.feed(body)
+    parser.close()
+    parser.finish_heading()
+    # Match prompts, not explanatory prose that happens to mention humans.
+    prompt = (r'(?:verify (?:that )?you are (?:a )?human|'
+              r'please verify you are human to continue|verify you are not a robot|'
+              r'security verification|checking your browser|bot verification|'
+              r'robot check|just a moment)[.!?…]*')
+    return any(re.fullmatch(prompt, heading, re.I) for heading in parser.headings)
+
+
 def usable_html(body, url):
     title = re.search(r'<title[^>]*>(.*?)</title>', body, re.I | re.S)
     if len(body) < 512 or not title or not html.unescape(title[1]).strip():
         return False
     if re.search(r'just a moment|access denied|temporarily unavailable|robot check|page not found|verify you are human', title[1], re.I):
+        return False
+    # A normal store title does not make a verification interstitial usable.
+    # This is a rejection heuristic, not proof that remaining content is valid.
+    if has_challenge_heading(body):
         return False
     for tag in re.findall(r'<link\b[^>]*>', body, re.I):
         attrs = dict((k.lower(), html.unescape(v)) for k, _, v in re.findall(r'([\w-]+)\s*=\s*([\'"])(.*?)\2', tag, re.S))
@@ -1235,9 +1294,6 @@ class Runner:
             evidence = self.client.verify(url, self.since)
             if evidence:
                 return self.verified_result(url, evidence, 'existing_index')
-            hold = self.outlink_submission_hold(url)
-            if hold:
-                return self.result(url, 'outlink-held', reason=hold)
             pending = self.state.get(url)
             created_pending = False
             if pending and pending.get('known_not_sent') is True and not pending.get('job_id') and not (self.verify_only or self.poll_only):
@@ -1266,6 +1322,11 @@ class Runner:
             if not pending and self.poll_only:
                 return self.result(url, 'unverified', reason='no saved job to poll; no submission made')
             if not pending:
+                # An unknown outlink expansion forbids a new POST, but must not
+                # prevent read-only reconciliation of an already saved job.
+                hold = self.outlink_submission_hold(url)
+                if hold:
+                    return self.result(url, 'outlink-held', reason=hold)
                 delay = max(0, self.next_submit - time.time())
                 if time.time() + delay + 120 >= self.deadline:
                     return self.result(url, 'deferred', reason='host cooldown/time budget', queue_untouched=True)
