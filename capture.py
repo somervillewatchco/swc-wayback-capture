@@ -90,11 +90,12 @@ def safe_status_ext(value):
         'no-access not-found proxy-error protocol-error read-timeout soft-time-limit-exceeded '
         'service-unavailable too-many-daily-captures too-many-redirects too-many-requests '
         'user-session-limit unauthorized max-daily-bandwidth max-daily-bandwidth-from-ip '
-        'max-daily-bandwidth-host').split()}
+        'max-daily-bandwidth-host host-crawling-paused').split()}
     return value if isinstance(value, str) and value in allowed else 'unknown'
 
 def response_metadata(http_status, headers, obj):
     """Allowlisted diagnostics only; never return raw messages, URLs or headers."""
+    obj = obj if isinstance(obj, dict) else {}
     status = obj.get('status')
     message = obj.get('message', '')
     message = message.lower() if isinstance(message, str) else ''
@@ -110,6 +111,15 @@ def response_metadata(http_status, headers, obj):
                 'host_paused' if 'host' in message and 'paused' in message else
                 'cannot_fetch' if 'cannot fetch' in message or 'could not fetch' in message else 'unknown')
     result['message_category'] = category
+    # Observations mirror pause's existing combined-detail predicates; they do
+    # not decide control flow or retain raw server text (including malformed fields).
+    detail = (str(obj.get('status_ext', '')) + ' ' + str(obj.get('message', ''))).lower()
+    result['pause_triggers'] = [name for name, matched in (
+        ('http_429', http_status == 429),
+        ('host_crawling_paused', 'host-crawling-paused' in detail),
+        ('host_pause_message', 'crawling this host is paused' in detail),
+        ('reported_http_429', bool(re.search(r'http status\s*[=:]\s*429', detail))),
+    ) if matched]
     reported = re.search(r'\bhttp status\s*[:=]\s*([1-5][0-9]{2})\b', message)
     if reported:
         result['message_reported_http_status'] = int(reported.group(1))
@@ -131,6 +141,7 @@ def response_metadata(http_status, headers, obj):
                 deadline = 0
         if deadline > 0:
             result['retry_after_until'] = deadline
+    result.update(safe_cache_metadata(headers))
     return result
 
 def latest_attempt_time(pending):
@@ -167,16 +178,9 @@ def job_observation(http_status, headers, obj, url, pending):
     return observation
 
 
-def account_observation(http_status, headers, obj):
-    """Capacity counters only; never echo account identity or response text."""
-    result = {'http_status': http_status, 'checked_at': timestamp(time.time()), 'schema_valid': False,
-              'cache_freshness': 'unknown'}
-    if isinstance(obj, dict):
-        for key in ('available', 'processing', 'daily_captures', 'daily_captures_limit'):
-            value = obj.get(key)
-            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                result[key] = value
-        result['schema_valid'] = 'available' in result and 'processing' in result
+def safe_cache_metadata(headers):
+    """Reported cache headers are observations, never proof of freshness."""
+    result = {'cache_freshness': 'unknown'}
     age = headers.get('age')
     if isinstance(age, str) and re.fullmatch(r'[0-9]{1,20}', age.strip()):
         result['response_age_seconds'] = int(age.strip())
@@ -191,6 +195,20 @@ def account_observation(http_status, headers, obj):
             pass
     if 'response_age_seconds' in result and 'response_date' in result:
         result['cache_freshness'] = 'reported_headers_only'
+    return result
+
+
+def account_observation(http_status, headers, obj):
+    """Capacity counters only; never echo account identity or response text."""
+    result = {'http_status': http_status, 'checked_at': timestamp(time.time()), 'schema_valid': False,
+              'cache_freshness': 'unknown'}
+    if isinstance(obj, dict):
+        for key in ('available', 'processing', 'daily_captures', 'daily_captures_limit'):
+            value = obj.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                result[key] = value
+        result['schema_valid'] = 'available' in result and 'processing' in result
+    result.update(safe_cache_metadata(headers))
     return result
 
 
@@ -972,6 +990,10 @@ class Runner:
         if self.pause(headers, {**(obj if isinstance(obj, dict) else {}), '_http': code}):
             batch['expansion_state'] = 'unknown'
             batch['server_paused_until'] = self.next_submit
+            if (phase == 'root_status' and code == 200 and detail.get('status') == 'error'
+                    and detail.get('root_job_id_matches') is True):
+                batch['terminal_paused_status'] = {'checked_at': detail['checked_at'],
+                    'resolution': 'strict_index_replay_only', 'pause_until_recorded': self.next_submit}
             self.save()
             return True
         return False
@@ -983,25 +1005,30 @@ class Runner:
                     if child.get('url') in products and child.get('coverage') == 'verified'}
         root_verified = bool(batch.get('root_evidence'))
         complete = root_verified and len(verified) == len(products)
-        return self.result(OUTLINK_PROBE, 'outlinks-verified' if complete else 'outlinks-partial',
+        return self.result(batch['root_url'], 'outlinks-verified' if complete else 'outlinks-partial',
             include_pending=False, reason=reason, root_verified=root_verified, expected_products=len(products),
             mapped_products=len(mapped), verified_products=len(verified),
             unreported_products=len(products - mapped), expansion_attribution='unproven', outlink_batch=batch)
 
-    def run_outlink_probe(self):
+    def run_outlink_probe(self, page=1):
         """One physical root POST total; subsequent invocations are read-only."""
+        if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= 6:
+            return self.result(OUTLINK_PROBE, 'review_required', reason='outlink page must be an integer from 1 to 6; no request made')
+        root = OUTLINK_PROBE if page == 1 else OUTLINK_PROBE + '?page=' + str(page)
         try:
             inventory, digest = load_outlink_inventory()
         except (LookupFailure, ValueError, OSError, TypeError):
-            return self.result(OUTLINK_PROBE, 'review_required', reason='frozen outlink inventory invalid; no request made')
+            return self.result(root, 'review_required', reason='frozen outlink inventory invalid; no request made')
+        if root not in inventory['root_urls']:
+            return self.result(root, 'review_required', reason='selected root absent from frozen inventory; no request made')
         known = set(inventory['root_urls'] + inventory['product_urls'] + [BASE+p for p in PRIORITY])
         journals = self.state.setdefault('_outlink_batches', {})
         if not isinstance(journals, dict):
-            return self.result(OUTLINK_PROBE, 'review_required', reason='outlink journal invalid; no request made')
-        exists = OUTLINK_PROBE in journals
-        batch = journals.get(OUTLINK_PROBE)
+            return self.result(root, 'review_required', reason='outlink journal invalid; no request made')
+        exists = root in journals
+        batch = journals.get(root)
         if exists and (not isinstance(batch, dict) or batch.get('inventory_sha256') != digest
-                or batch.get('root_url') != OUTLINK_PROBE
+                or batch.get('root_url') != root
                 or not isinstance(batch.get('children'), dict)
                 or not isinstance(batch.get('child_order'), list)
                 or any(key not in batch['children'] for key in batch['child_order'])
@@ -1009,23 +1036,23 @@ class Runner:
                 or not 0 <= batch['verification_cursor'] <= len(batch['child_order'])
                 or not isinstance(batch.get('utc_day'), (int, float))
                 or not 0 < batch['utc_day'] <= time.time() + 86400):
-            return self.result(OUTLINK_PROBE, 'review_required', reason='outlink journal/inventory mismatch; no request made')
+            return self.result(root, 'review_required', reason='outlink journal/inventory mismatch; no request made')
         if not exists:
             if self.verify_only or self.poll_only:
-                return self.result(OUTLINK_PROBE, 'outlinks-partial', reason='no saved outlink batch; read-only mode never submits')
+                return self.result(root, 'outlinks-partial', reason='no saved outlink batch; read-only mode never submits')
             if not self.recover_transport(cycle=1):
-                return self.result(OUTLINK_PROBE, 'deferred', reason='mandatory paced health gate failed; no outlink submission')
+                return self.result(root, 'deferred', reason='mandatory paced health gate failed; no outlink submission')
             try:
-                before = self.client.verify(OUTLINK_PROBE, self.since)
+                before = self.client.verify(root, self.since)
             except (LookupFailure, ValueError, OSError):
-                return self.result(OUTLINK_PROBE, 'deferred', reason='pre-submission archive evidence unavailable; no outlink submission')
-            batch = {'root_url': OUTLINK_PROBE, 'inventory_sha256': digest,
+                return self.result(root, 'deferred', reason='pre-submission archive evidence unavailable; no outlink submission')
+            batch = {'root_url': root, 'inventory_sha256': digest,
                      'utc_day': self.since, 'created_at': time.time(), 'root_evidence_before': before,
-                     'direct_pending_reference': OUTLINK_PROBE in self.state,
+                     'direct_pending_reference': root in self.state,
                      'request': {'capture_outlinks': '1', 'if_not_archived_within': '1,1d'},
                      'post_state': 'not_dispatched', 'expansion_state': 'unknown',
                      'children': {}, 'child_order': [], 'verification_cursor': 0, 'responses': []}
-            journals[OUTLINK_PROBE] = batch
+            journals[root] = batch
             self.save()  # Atomic journal BEFORE any potentially accepted root POST.
             old_callback = self.client.post_attempt_callback
             def record_attempt(attempt):
@@ -1035,7 +1062,7 @@ class Runner:
             self.client.post_attempt_callback = record_attempt
             try:
                 code, headers, body, _ = self.client.paced_request('https://web.archive.org/save/',
-                    {'url': OUTLINK_PROBE, 'capture_outlinks': '1', 'if_not_archived_within': '1,1d'}, True)
+                    {'url': root, 'capture_outlinks': '1', 'if_not_archived_within': '1,1d'}, True)
                 try:
                     obj = json.loads(body)
                 except (ValueError, TypeError):
@@ -1054,9 +1081,24 @@ class Runner:
             finally:
                 self.client.post_attempt_callback = old_callback
         # Existing batch, including no-ID or proven-unsent outcomes, never POSTs.
+        # Migrate already-recorded terminal paused observations (including older
+        # sanitized records without the precise pause cause). Never reread that
+        # terminal status merely to restart its local fallback cooldown.
+        if not batch.get('terminal_paused_status'):
+            responses = batch.get('responses', [])
+            last = responses[-1] if isinstance(responses, list) and responses else None
+            pause_until = batch.get('server_paused_until')
+            if (isinstance(last, dict) and last.get('phase') == 'root_status'
+                    and last.get('http_status') == 200 and last.get('status') == 'error'
+                    and last.get('root_job_id_matches') is True
+                    and isinstance(pause_until, (int, float)) and not isinstance(pause_until, bool)
+                    and 0 < pause_until < float('inf')):
+                batch['terminal_paused_status'] = {'checked_at': last.get('checked_at'),
+                    'resolution': 'strict_index_replay_only', 'pause_until_recorded': pause_until}
+                self.save()
         try:
             job = batch.get('root_job_id')
-            if isinstance(job, str) and re.fullmatch(r'[A-Za-z0-9_-]+', job):
+            if not batch.get('terminal_paused_status') and isinstance(job, str) and re.fullmatch(r'[A-Za-z0-9_-]+', job):
                 code, headers, body, _ = self.client.paced_request('https://web.archive.org/save/status/'+job, authenticated=True)
                 try:
                     obj = json.loads(body)
@@ -1065,7 +1107,7 @@ class Runner:
                 if self.record_outlink_response(batch, code, {k.lower():v for k,v in headers.items()}, obj, known, 'root_status'):
                     return self.outlink_report(batch, inventory, 'server paused status lookup; IDs retained, no further requests')
             start, end = batch['utc_day'], batch['utc_day'] + 86400 - 1
-            evidence = self.client.verify(OUTLINK_PROBE, start, until=end)
+            evidence = self.client.verify(root, start, until=end)
             if evidence:
                 batch['root_evidence'] = evidence
                 batch['root_capture_after_attempt'] = bool(batch.get('attempt')) and epoch(evidence['timestamp']) >= batch['attempt']['started_at'] - 5
@@ -1375,6 +1417,7 @@ def main():
     mode.add_argument('--verify-only', action='store_true')
     mode.add_argument('--poll-only', action='store_true', help='Read existing job status and archive evidence; never submit')
     parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental', 'transport_probe', 'pacing_probe', 'pacing_job_diagnostic', 'account_diagnostic', 'supplemental_probe', 'outlink_probe'), default='all')
+    parser.add_argument('--outlink-page', type=int, choices=range(1, 7), default=1, help='One frozen Shop All page; only used with outlink_probe')
     parser.add_argument('--state', default='.capture-state/pending.json')
     mode.add_argument('--inspect-state', action='store_true', help='Emit sanitized saved-state summary only; no network or state mutation')
     parser.add_argument('--budget', type=int, default=17400)
@@ -1393,7 +1436,7 @@ def main():
     budget = min(args.budget, 1800) if args.scope in ('pacing_probe', 'pacing_job_diagnostic', 'account_diagnostic', 'supplemental_probe', 'outlink_probe') else args.budget
     runner = Runner(client, args.state, budget, verify_only=args.verify_only, poll_only=args.poll_only)
     if args.scope == 'outlink_probe':
-        row = runner.run_outlink_probe()
+        row = runner.run_outlink_probe(args.outlink_page)
         print('Outlink expansion and child coverage are separate; partial is not complete.')
         return 0 if row['state'] == 'outlinks-verified' else 1
     if args.scope == 'account_diagnostic':

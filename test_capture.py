@@ -1669,12 +1669,75 @@ class OutlinkBatchTests(unittest.TestCase):
         self.assertEqual(row['state'],'outlinks-partial')
         self.assertNotIn('SECRET',Path('state.json').read_text())
 
+    def test_page_two_is_single_explicit_root_and_preserves_page_one(self):
+        self.r.run_outlink_probe()
+        original=json.loads(json.dumps(self.batch()))
+        self.root=self.inventory['root_urls'][1]
+        self.r.run_outlink_probe(2)
+        self.assertEqual(self.physical_posts,2)
+        self.assertEqual(self.r.state['_outlink_batches'][self.inventory['root_urls'][0]],original)
+        self.assertEqual(self.batch()['root_url'],self.root)
+        self.assertEqual([c[1]['url'] for c in self.calls if c[1]],self.inventory['root_urls'][:2])
+        self.assertEqual(self.r.recover_transport.call_count,2)
+        self.r.run_outlink_probe(2)
+        self.assertEqual(self.physical_posts,2)
+        self.assertEqual(self.r.recover_transport.call_count,2)
+
+    def test_invalid_page_and_readonly_new_page_never_dispatch(self):
+        for page in (0,7,True,None,'2','?page=2'):
+            self.assertEqual(self.r.run_outlink_probe(page)['state'],'review_required')
+        self.r.verify_only=True
+        self.r.run_outlink_probe(2)
+        self.r.recover_transport.assert_not_called();self.c.paced_request.assert_not_called()
+
+    def test_terminal_pause_resumes_index_only_without_renewal_or_post(self):
+        self.status={'job_id':'new-root','status':'error','status_ext':'error:host-crawling-paused'}
+        self.r.run_outlink_probe()
+        batch=self.batch();deadline=self.r.state['_next_submit']
+        self.assertTrue(batch['terminal_paused_status'])
+        self.c.paced_request.reset_mock();self.c.verify.reset_mock()
+        self.r.run_outlink_probe()
+        self.c.paced_request.assert_not_called()
+        self.c.verify.assert_called_once_with(self.root,batch['utc_day'],until=batch['utc_day']+86400-1)
+        self.assertEqual(self.r.state['_next_submit'],deadline)
+        self.assertEqual(self.physical_posts,1)
+        self.assertIsNotNone(self.r.outlink_submission_hold(self.product))
+        self.assertEqual(batch['root_job_id'],'new-root')
+
+    def test_legacy_terminal_pause_migrates_without_missing_raw_cause(self):
+        self.status={'job_id':'new-root','status':'error','status_ext':'error:host-crawling-paused'}
+        self.r.run_outlink_probe();batch=self.batch();batch.pop('terminal_paused_status')
+        last=batch['responses'][-1];last['status_ext']='unknown';last.pop('pause_triggers',None)
+        deadline=self.r.state['_next_submit'];self.c.paced_request.reset_mock()
+        self.r.run_outlink_probe()
+        self.c.paced_request.assert_not_called();self.assertTrue(batch['terminal_paused_status'])
+        self.assertEqual(self.r.state['_next_submit'],deadline)
+
+    def test_mismatched_or_http429_observation_does_not_mark_terminal(self):
+        self.r.run_outlink_probe();batch=self.batch()
+        for code,job in ((429,'new-root'),(200,'other-root')):
+            self.r.record_outlink_response(batch,code,{},
+                {'job_id':job,'status':'error','status_ext':'error:host-crawling-paused'}, {self.product},'root_status')
+            self.assertNotIn('terminal_paused_status',batch)
+            self.assertGreater(self.r.state['_next_submit'],time.time()+650)
+
+    def test_explicit_page_cli_and_workflow_choice(self):
+        from capture import main
+        with patch('sys.argv',['capture.py','--scope','outlink_probe','--outlink-page','2']),patch('capture.Runner') as runner:
+            runner.return_value.run_outlink_probe.return_value={'state':'outlinks-partial'}
+            self.assertEqual(main(),1)
+            runner.return_value.run_outlink_probe.assert_called_once_with(2)
+            runner.return_value.run_queue.assert_not_called()
+        workflow=(Path(__file__).resolve().parent/'.github/workflows/wayback-snapshot.yml').read_text()
+        self.assertIn("options: ['1', '2', '3', '4', '5', '6']",workflow)
+        self.assertIn('--outlink-page "$OUTLINK_PAGE"',workflow)
+
     def test_scope_only_fixed_probe_budget_and_no_discovery_or_broad_queue(self):
         from capture import main
         with patch('sys.argv',['capture.py','--scope','outlink_probe']),patch('capture.Runner') as runner,patch('capture.discover') as discover,patch('capture.discover_supplemental') as supplemental:
             runner.return_value.run_outlink_probe.return_value={'state':'outlinks-partial'}
             self.assertEqual(main(),1);self.assertEqual(runner.call_args.args[2],1800)
-            runner.return_value.run_outlink_probe.assert_called_once_with()
+            runner.return_value.run_outlink_probe.assert_called_once_with(1)
             runner.return_value.run_queue.assert_not_called();discover.assert_not_called();supplemental.assert_not_called()
 
 class WorkflowTests(unittest.TestCase):
@@ -1691,5 +1754,60 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("key: ${{ inputs.recovery_cache_key && 'wayback-recovery-v1' || 'wayback-state-v1' }}", workflow)
         self.assertIn("restore-keys: ${{ !inputs.recovery_cache_key && 'wayback-state-v1-' || '' }}", workflow)
         self.assertIn('args+=(--poll-only)', workflow)
+
+class PauseMetadataTests(unittest.TestCase):
+    def test_each_existing_pause_predicate_has_safe_distinct_observation(self):
+        from capture import response_metadata
+        cases = [
+            (429, {}, ['http_429']),
+            (200, {'status_ext': 'error:host-crawling-paused'}, ['host_crawling_paused']),
+            (200, {'message': 'Crawling this host is paused'}, ['host_pause_message']),
+            (200, {'message': 'HTTP status=429'}, ['reported_http_429']),
+            (200, {'message': 'HTTP status: 429'}, ['reported_http_429']),
+            (200, {'status_ext': 'HTTP status=429'}, ['reported_http_429']),
+            (200, {'status_ext': 'crawling this host', 'message': 'is paused'}, ['host_pause_message']),
+        ]
+        for code, obj, expected in cases:
+            with self.subTest(code=code, obj=obj):
+                result = response_metadata(code, {}, obj)
+                self.assertEqual(result['pause_triggers'], expected)
+        self.assertEqual(response_metadata(200, {}, cases[1][1])['status_ext'], 'error:host-crawling-paused')
+
+    def test_raw_unknown_and_malformed_fields_are_never_retained(self):
+        from capture import response_metadata
+        for obj in (None, [], 'SECRET', {'status_ext': ['SECRET'], 'message': {'secret': 'SECRET'}},
+                    {'status_ext': 'error:host-crawling-paused SECRET', 'message': 'SECRET HTTP status=429'}):
+            result = response_metadata(200, {}, obj)
+            self.assertNotIn('SECRET', json.dumps(result))
+            self.assertEqual(result['status_ext'], 'unknown')
+        self.assertEqual(response_metadata(200, {}, {'message': 'unknown SECRET'})['pause_triggers'], [])
+
+    def test_response_cache_headers_are_safe_observations_not_freshness_proof(self):
+        from capture import response_metadata, account_observation
+        headers = {'age': '120', 'date': 'Mon, 02 Nov 2026 17:25:00 GMT'}
+        result = response_metadata(200, headers, {})
+        self.assertEqual(result['response_age_seconds'], 120)
+        self.assertEqual(result['response_date'], headers['date'])
+        self.assertEqual(result['cache_freshness'], 'reported_headers_only')
+        account = account_observation(200, headers, {})
+        for key in ('response_age_seconds', 'response_date', 'cache_freshness'):
+            self.assertEqual(result[key], account[key])
+        for bad_headers in ({}, {'date': headers['date']}, {'age': True, 'date': 'SECRET'},
+                            {'age': '-1', 'date': ['SECRET']}, {'age': 'SECRET', 'date': 'SECRET'}):
+            result = response_metadata(200, bad_headers, {})
+            self.assertEqual(result['cache_freshness'], 'unknown')
+            self.assertNotIn('response_age_seconds', result)
+            self.assertNotIn('SECRET', json.dumps(result))
+
+    def test_observation_tracks_unchanged_pause_predicate(self):
+        from capture import response_metadata
+        import re
+        cases = [{'message': 'HTTP status=4299'}, {'status_ext': ['host-crawling-paused']},
+                 {'message': 'crawling this host is paused SECRET'}, {}, {'message': None}]
+        for obj in cases:
+            detail = (str(obj.get('status_ext', '')) + ' ' + str(obj.get('message', ''))).lower()
+            expected = ('host-crawling-paused' in detail or 'crawling this host is paused' in detail
+                        or bool(re.search(r'http status\s*[=:]\s*429', detail)))
+            self.assertEqual(bool(response_metadata(200, {}, obj)['pause_triggers']), expected)
 
 if __name__ == '__main__': unittest.main()

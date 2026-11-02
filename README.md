@@ -250,10 +250,11 @@ may nevertheless discover those pages or external domains as children: its API
 has no documented same-site exclusion filter, so this implementation cannot promise
 that those incidental child captures are excluded.
 
-Only `--scope outlink_probe` is executable now: fixed first root
-`https://somervillewatchco.com/collections/all`, maximum30-minute budget. The other
-five root URLs are a reviewed inventory, not an active bulk submission mode. First
-validate the canary's evidence before implementing/dispatching the remaining roots.
+Use `--scope outlink_probe --outlink-page N` for exactly one frozen Shop All
+root, with N from 1 through 6 (default1), maximum30-minute budget. Page1 is
+`https://somervillewatchco.com/collections/all`; pages2–6 have their exact
+`?page=N` query. Each root has an isolated journal and at most one physical POST.
+Existing roots resume read-only; there is no bulk loop or automatic page advance.
 The mandatory existing two-pass paced health gate and strict pre-CDX/replay check
 run first. Existing root coverage is recorded separately and does not imply
 outlink expansion; the approved duplicate-risk test may still submit once.
@@ -300,3 +301,12 @@ provided. This may reduce scheduled throughput while uncertainty is unresolved.
 The120-second global request floor, server cooldowns, strict evidence requirements
 and previously documented daily-throughput limitation remain unchanged. Outlinks
 may create captures in parallel, but independent verification still takes time.
+
+A matching HTTP200 terminal-error root status that triggered a recorded host
+pause is not automatically polled again. Older saved terminal-error plus pause
+observations are conservatively migrated to the same read-only reconciliation
+mode. Existing cooldowns remain in force; CDX/exact replay can establish coverage,
+but unknown expansion holds and all job records remain protected. This avoids
+restarting a local fallback timer by rereading the same terminal observation; it
+does not override a new server429 or Retry-After. Job ID equality alone is not
+evidence of capture reuse, and lost IDs must not be guessed from URL hashes.
