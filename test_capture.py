@@ -1261,6 +1261,86 @@ class GlobalArchivePacingTests(unittest.TestCase):
         other.request('https://web.archive.org/cdx/search/cdx')
         self.assertGreaterEqual(self.calls[0][2],1793600900)
 
+    def test_known_job_diagnostic_one_get_preserves_pending_review_and_queues(self):
+        from capture import PACING_PROBE
+        pending={'job_id':'known-job','submitted_at':self.now-300,'review_required':True,
+                 'request_evidence':{'attempts':[{'started_at':self.now-60}]}}
+        self.r.state[PACING_PROBE]=pending
+        self.r.state['_queues']={'all:20261102:capture':{'cursor':5,'urls':[URL]*10,'results':[],'complete':False}}
+        queues=json.loads(json.dumps(self.r.state['_queues']))
+        obj={'status':'error','status_ext':'error:bad-request','job_id':'known-job',
+             'message':'SECRET invalid syntax (HTTP status=401)', 'exception':'TimeoutError SECRET',
+             'original_url':'https://example.invalid/SECRET','timestamp':timestamp(self.now-120),
+             'resources':[{'secret':'SECRET'}]}
+        self.c._request.side_effect=None
+        self.c._request.return_value=(200,{},json.dumps(obj),'unused')
+        row=self.r.diagnose_saved_pacing_job()
+        self.assertEqual(row['state'],'diagnostic-observed')
+        self.assertEqual(self.c._request.call_count,1)
+        self.c._request.assert_called_once_with('https://web.archive.org/save/status/known-job',None,True)
+        self.assertTrue(pending['review_required']);self.assertEqual(pending['job_id'],'known-job')
+        self.assertEqual(self.r.state['_queues'],queues)
+        detail=pending['job_diagnostic']
+        self.assertEqual(detail['message_reported_http_status'],401)
+        self.assertEqual(detail['message_category'],'invalid_syntax')
+        self.assertEqual(detail['exception_category'],'timeout')
+        self.assertTrue(detail['response_job_id_matches']);self.assertFalse(detail['original_url_matches'])
+        self.assertFalse(detail['timestamp_fresh']);self.assertEqual(detail['resources_count'],1)
+        self.assertNotIn('SECRET',Path('state.json').read_text()+json.dumps(row))
+    def test_known_job_diagnostic_does_not_retry_failure_or_guess_missing_id(self):
+        from capture import PACING_PROBE
+        self.assertEqual(self.r.diagnose_saved_pacing_job()['state'],'diagnostic-unavailable')
+        self.c._request.assert_not_called()
+        self.r.state[PACING_PROBE]={'job_id':'known-job','submitted_at':self.now,'review_required':True}
+        self.c._request.side_effect=LookupFailure('SECRET',transport={'phase':'tcp_connect','reason_class':'TimeoutError','errno':110,'message':'SECRET'})
+        self.assertEqual(self.r.diagnose_saved_pacing_job()['state'],'diagnostic-unavailable')
+        self.assertEqual(self.c._request.call_count,1)
+        self.assertTrue(self.r.state[PACING_PROBE]['review_required'])
+        self.assertEqual(self.r.state[PACING_PROBE]['job_diagnostic']['transport']['errno'],110)
+        self.assertEqual(self.r.state[PACING_PROBE]['job_diagnostic']['transport']['transport_phase'],'tcp_connect')
+        self.assertNotIn('SECRET',Path('state.json').read_text())
+    def test_known_job_diagnostic_respects_pending_cooldown(self):
+        from capture import PACING_PROBE
+        self.r.state[PACING_PROBE]={'job_id':'known-job','submitted_at':self.now,
+                                   'status_paused_until':self.now+900,'review_required':True}
+        start=self.now;self.r.diagnose_saved_pacing_job()
+        self.assertEqual(len(self.calls),1);self.assertGreaterEqual(self.calls[0][2],start+900)
+    def test_known_job_diagnostic_budget_does_not_send_or_clear(self):
+        from capture import PACING_PROBE
+        self.r.state[PACING_PROBE]={'job_id':'known-job','submitted_at':self.now,'review_required':True}
+        self.c.archive_deadline=self.now+100
+        self.c.archive_next_request_at=self.now+900
+        row=self.r.diagnose_saved_pacing_job()
+        self.assertEqual(row['state'],'deferred');self.c._request.assert_not_called()
+        self.assertTrue(self.r.state[PACING_PROBE]['review_required'])
+    def test_actual_last_attempt_freshness_and_legacy_fallback(self):
+        from capture import latest_attempt_time,job_observation
+        pending={'submitted_at':self.now-300,'job_id':'job',
+                 'request_evidence':{'attempts':[{'started_at':self.now-200},{'started_at':self.now-30}]}}
+        self.assertEqual(latest_attempt_time(pending),self.now-30)
+        obj={'timestamp':timestamp(self.now-100),'original_url':URL,'job_id':'job'}
+        self.assertFalse(job_observation(200,{},obj,URL,pending)['timestamp_fresh'])
+        self.r.state[URL]=pending
+        row=self.r.verified_result(URL,{'timestamp':obj['timestamp']},'existing_index')
+        self.assertFalse(row['new_capture'])
+        for bad in (None,{'attempts':[{'started_at':True}]},{'attempts':[{'started_at':float('inf')}]}, {'attempts':['invalid']}):
+            self.assertEqual(latest_attempt_time({'submitted_at':self.now-300,'request_evidence':bad}),self.now-300)
+    def test_message_reported_status_only_explicit_valid_pattern(self):
+        from capture import response_metadata
+        for message in ('SECRET 401', 'HTTP status=999', 'HTTP status=099','HTTP status=4012'):
+            self.assertNotIn('message_reported_http_status',response_metadata(200,{}, {'message':message}))
+        self.assertEqual(response_metadata(200,{}, {'message':'HTTP status=503'})['message_reported_http_status'],503)
+        self.assertEqual(response_metadata(200,{}, {'message':'HTTP status: 401'})['message_reported_http_status'],401)
+    def test_job_diagnostic_scope_bypasses_discovery_queue_and_verify_flags(self):
+        from capture import main
+        for flags in ([],['--verify-only'],['--poll-only']):
+            with patch('sys.argv',['capture.py','--scope','pacing_job_diagnostic']+flags),patch('capture.Runner') as runner,patch('capture.discover') as discover,patch('capture.discover_supplemental') as supplemental:
+                runner.return_value.diagnose_saved_pacing_job.return_value={'state':'diagnostic-observed'}
+                self.assertEqual(main(),0)
+                self.assertEqual(runner.call_args.args[2],1800)
+                runner.return_value.diagnose_saved_pacing_job.assert_called_once_with()
+                runner.return_value.run_queue.assert_not_called();discover.assert_not_called();supplemental.assert_not_called()
+
     def test_health_requests_obey_same_gate(self):
         def health(url,*args):
             self.calls.append((url,None,self.now));self.now+=5

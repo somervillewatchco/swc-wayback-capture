@@ -167,3 +167,26 @@ establish complete daily194-page coverage at that rate. Queue resumption prevent
 abandonment, but does not make the daily goal feasible or justify reporting success.
 Earlier120-second diagnostics also failed, so pacing is not yet proven to fix the
 intermittent network problem.
+
+### One saved-job diagnostic without submission or verification
+
+Manual scope `pacing_job_diagnostic` selects only the saved Olive Green pacing
+probe job. Regardless of the verify checkbox, it performs at most one authenticated
+status GET through the global gate (no automatic retry), then stops. A missing or
+invalid saved job ID causes zero requests. It never enumerates inventory, performs
+CDX/replay checks, submits, clears pending/review state, or processes queue cursors.
+It respects saved cooldowns and has a maximum30-minute budget. A follow-up archive
+verification must be a separate, properly paced operation.
+
+The observation preserves safe status/error categories, an explicitly reported
+`HTTP status=NNN`/`HTTP status: NNN` number, exception-presence/category, job/URL
+match booleans, valid timestamp/freshness and resource count—not raw server text,
+returned URLs, resource details, headers or credentials. A message-reported HTTP
+number is **not** an independently observed origin status. Transport failures retain
+only sanitized phase/class/errno. An observed status is not capture coverage.
+
+Freshness/new-capture classification now uses the last valid physical attempt's
+`request_evidence.attempts[-1].started_at`; legacy records fall back to submitted_at.
+A capture that predates the paced actual submission may establish existing daily
+coverage, but is not labeled a new capture attributable to that attempt. Timing
+alone still does not establish that this particular job caused the capture.

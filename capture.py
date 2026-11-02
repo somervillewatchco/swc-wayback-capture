@@ -64,6 +64,20 @@ def response_metadata(http_status, headers, obj):
               'status': status if status in ('success', 'pending', 'error') else 'unknown',
               'status_ext': safe_status_ext(obj.get('status_ext')),
               'message_classification': classification}
+    category = ('invalid_syntax' if 'invalid syntax' in message or 'could not understand the request' in message else
+                'authentication_required' if 'authentication' in message or 'unauthorized' in message else
+                'host_paused' if 'host' in message and 'paused' in message else
+                'cannot_fetch' if 'cannot fetch' in message or 'could not fetch' in message else 'unknown')
+    result['message_category'] = category
+    reported = re.search(r'\bhttp status\s*[:=]\s*([1-5][0-9]{2})\b', message)
+    if reported:
+        result['message_reported_http_status'] = int(reported.group(1))
+    exception = obj.get('exception')
+    result['exception_present'] = exception is not None
+    exception_text = exception.lower() if isinstance(exception, str) else ''
+    result['exception_category'] = ('timeout' if 'timeout' in exception_text or 'timed out' in exception_text else
+        'connection_refused' if 'connectionrefused' in exception_text or 'connection refused' in exception_text else
+        'tls_error' if 'sslerror' in exception_text or 'certificate verify failed' in exception_text else 'unknown')
     retry = headers.get('retry-after')
     if retry is not None:
         try:
@@ -77,6 +91,40 @@ def response_metadata(http_status, headers, obj):
         if deadline > 0:
             result['retry_after_until'] = deadline
     return result
+
+def latest_attempt_time(pending):
+    request = pending.get('request_evidence', {})
+    attempts = request.get('attempts', []) if isinstance(request, dict) else []
+    value = attempts[-1].get('started_at') if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict) else None
+    if not (isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= time.time() + 60):
+        value = pending.get('submitted_at')
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= time.time() + 60 else None
+
+
+def job_observation(http_status, headers, obj, url, pending):
+    observation = response_metadata(http_status, headers, obj)
+    observation.update(checked_at=timestamp(time.time()),
+        response_job_id_matches=isinstance(obj.get('job_id'), str) and obj['job_id'] == pending.get('job_id'),
+        original_url_present=bool(obj.get('original_url')),
+        original_url_matches=identity(obj.get('original_url')) == identity(url))
+    value = obj.get('timestamp')
+    observation['timestamp_valid_format'] = isinstance(value, str) and bool(re.fullmatch(r'[0-9]{14}', value))
+    observation['timestamp_fresh'] = False
+    if observation['timestamp_valid_format']:
+        try:
+            captured = epoch(value)
+            observation['timestamp'] = value
+            started = latest_attempt_time(pending)
+            observation['timestamp_fresh'] = started is not None and started - 5 <= captured <= time.time() + 60
+        except ValueError:
+            observation['timestamp_valid_format'] = False
+    resources = obj.get('resources')
+    if isinstance(resources, (list, dict)):
+        observation['resources_count'] = len(resources)
+    elif isinstance(resources, int) and not isinstance(resources, bool) and resources >= 0:
+        observation['resources_count'] = resources
+    return observation
+
 
 def safe_recovery_event(event):
     result = {}
@@ -543,7 +591,7 @@ class Runner:
             row['job_id'] = job_id
         if isinstance(pending.get('submitted_at'), (int, float)):
             row['submitted_at'] = pending['submitted_at']
-        for key in ('status_evidence', 'request_evidence', 'terminal_reused', 'retry_eligible_at', 'review_required', 'submission_response', 'status_response', 'transport_failure', 'known_not_sent', 'status_error', 'server_retry_after_until', 'status_paused_until'):
+        for key in ('status_evidence', 'request_evidence', 'terminal_reused', 'retry_eligible_at', 'review_required', 'submission_response', 'status_response', 'transport_failure', 'known_not_sent', 'status_error', 'server_retry_after_until', 'status_paused_until', 'job_diagnostic'):
             if key in pending:
                 row[key] = pending[key]
         return row
@@ -574,7 +622,7 @@ class Runner:
 
     def verified_result(self, url, evidence, coverage_source):
         pending = self.state.get(url, {})
-        submitted_at = pending.get('submitted_at')
+        submitted_at = latest_attempt_time(pending)
         new_capture = (isinstance(submitted_at, (int, float))
                        and epoch(evidence['timestamp']) >= submitted_at - 5)
         details = dict(coverage_source=coverage_source, new_capture=new_capture, **evidence)
@@ -632,7 +680,7 @@ class Runner:
         # This job is definitively completed with a usable older capture. Do
         # not poll it forever or call it today's coverage. The next UTC day's
         # regular opportunity is our scheduling policy, not an Archive limit.
-        attempt_day = dt.datetime.fromtimestamp(pending['submitted_at'], UTC).replace(
+        attempt_day = dt.datetime.fromtimestamp(latest_attempt_time(pending) or pending['submitted_at'], UTC).replace(
             hour=0, minute=0, second=0, microsecond=0).timestamp()
         pending['terminal_reused'] = evidence
         pending['retry_eligible_at'] = max(attempt_day + 86400,
@@ -789,6 +837,42 @@ class Runner:
         for url in queue['urls'][queue['cursor']:]:
             self.result(url, 'deferred', reason='untouched queue checkpoint saved; recovery cycles or run budget exhausted')
 
+    def diagnose_saved_pacing_job(self):
+        """Exactly one gated authenticated status GET; never verify/submit/retire."""
+        url = PACING_PROBE
+        pending = self.state.get(url)
+        if not isinstance(pending, dict) or not isinstance(pending.get('job_id'), str) or not re.fullmatch(r'[A-Za-z0-9_-]+', pending['job_id']):
+            return self.result(url, 'diagnostic-unavailable', reason='no valid saved job ID; no request made')
+        self.client.archive_next_request_at = max(self.client.archive_next_request_at,
+            pending.get('status_paused_until', 0), pending.get('server_retry_after_until', 0))
+        try:
+            code, headers, body, _ = self.client.paced_request(
+                'https://web.archive.org/save/status/' + pending['job_id'], authenticated=True)
+            try:
+                obj = json.loads(body)
+            except (ValueError, TypeError):
+                obj = None
+            if isinstance(obj, dict):
+                observation = job_observation(code, {k.lower():v for k,v in headers.items()}, obj, url, pending)
+                observation['schema_valid'] = True
+            else:
+                observation = {'http_status': code, 'schema_valid': False, 'checked_at': timestamp(time.time())}
+            pending['job_diagnostic'] = observation
+            self.save()
+            return self.result(url, 'diagnostic-observed', reason='one saved-job status observation; no capture verification or resubmission')
+        except RequestDeferred:
+            return self.result(url, 'deferred', reason='saved-job diagnostic pacing/cooldown exceeds budget; no request made')
+        except LookupFailure as exc:
+            pending['job_diagnostic'] = {'checked_at': timestamp(time.time()), 'outcome': 'lookup_failed',
+                                         'error_class': type(exc).__name__}
+            detail = exc.transport if isinstance(exc.transport, dict) else {}
+            safe = safe_recovery_event({'transport_phase': detail.get('phase'),
+                                        'reason_class': detail.get('reason_class'), 'errno': detail.get('errno')})
+            if safe:
+                pending['job_diagnostic']['transport'] = safe
+            self.save()
+            return self.result(url, 'diagnostic-unavailable', reason='single saved-job status lookup failed; job retained')
+
     def _process(self, url):
         created_pending = False
         if time.time() + 35 >= self.deadline:
@@ -904,7 +988,8 @@ class Runner:
                     raise LookupFailure('Status endpoint HTTP %s' % status)
                 if obj.get('status') == 'success':
                     try:
-                        fresh = pending['submitted_at'] - 5 <= epoch(obj.get('timestamp', '')) <= time.time() + 60
+                        started = latest_attempt_time(pending)
+                        fresh = started is not None and started - 5 <= epoch(obj.get('timestamp', '')) <= time.time() + 60
                     except (ValueError, TypeError):
                         fresh = False
                     original_matches = identity(obj.get('original_url')) == identity(url)
@@ -974,7 +1059,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--verify-only', action='store_true')
     mode.add_argument('--poll-only', action='store_true', help='Read existing job status and archive evidence; never submit')
-    parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental', 'transport_probe', 'pacing_probe'), default='all')
+    parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental', 'transport_probe', 'pacing_probe', 'pacing_job_diagnostic'), default='all')
     parser.add_argument('--state', default='.capture-state/pending.json')
     mode.add_argument('--inspect-state', action='store_true', help='Emit sanitized saved-state summary only; no network or state mutation')
     parser.add_argument('--budget', type=int, default=17400)
@@ -990,8 +1075,12 @@ def main():
         print(json.dumps(summary), flush=True)
         return 0
     client = Client()
-    budget = min(args.budget, 1800) if args.scope == 'pacing_probe' else args.budget
+    budget = min(args.budget, 1800) if args.scope in ('pacing_probe', 'pacing_job_diagnostic') else args.budget
     runner = Runner(client, args.state, budget, verify_only=args.verify_only, poll_only=args.poll_only)
+    if args.scope == 'pacing_job_diagnostic':
+        row = runner.diagnose_saved_pacing_job()
+        print('Read-only saved-job observation only; not capture coverage.')
+        return 0 if row['state'] == 'diagnostic-observed' else 1
     urls = [] if args.scope == 'supplemental' else [BASE + p for p in (['/pages/warranty-policy'] if args.scope == 'pilot' else PRIORITY)]
     if args.scope == 'transport_probe':
         urls = [TRANSPORT_PROBE]
