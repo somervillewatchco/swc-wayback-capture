@@ -1502,6 +1502,181 @@ class GlobalArchivePacingTests(unittest.TestCase):
         runner.return_value.run_queue.assert_called_once_with([PACING_PROBE],'pacing_probe')
         self.assertEqual(PACING_PROBE,BASE+'/products/date-mod-olive-green-watch')
 
+class OutlinkBatchTests(unittest.TestCase):
+    def setUp(self):
+        from capture import load_outlink_inventory,OUTLINK_PROBE
+        self.inventory,self.digest=load_outlink_inventory();self.root=OUTLINK_PROBE
+        self.product=self.inventory['product_urls'][0];self.second=self.inventory['product_urls'][1]
+        self.tmp=tempfile.TemporaryDirectory();self.old=os.getcwd();os.chdir(self.tmp.name)
+        self.c=Mock(spec=Client);self.c.post_attempt_callback=None;self.c.verify.return_value=None
+        self.r=Runner(self.c,'state.json',budget=1800);self.r.recover_transport=Mock(return_value=True)
+        self.post={'job_id':'new-root','status':'pending'}
+        self.status={'job_id':'new-root','status':'success','outlinks':{self.product:'child-job'}}
+        self.physical_posts=0;self.calls=[]
+        self.c.paced_request.side_effect=self.request
+    def tearDown(self):os.chdir(self.old);self.tmp.cleanup()
+    def request(self,url,data=None,authenticated=False):
+        self.calls.append((url,data,authenticated))
+        if data is not None:
+            saved=json.loads(Path('state.json').read_text())
+            assert self.root in saved['_outlink_batches']
+            self.physical_posts+=1
+            self.c.post_attempt_callback({'attempt':1,'started_at':time.time()})
+            return 200,{},json.dumps(self.post),url
+        return 200,{},json.dumps(self.status),url
+    def batch(self):return self.r.state['_outlink_batches'][self.root]
+    def evidence(self):return {'timestamp':timestamp(time.time()),'replay':'verified-exact-replay'}
+    def test_exact_one_root_post_fixed_options_and_journal_before_io(self):
+        row=self.r.run_outlink_probe()
+        self.assertEqual(self.physical_posts,1)
+        self.r.recover_transport.assert_called_once_with(cycle=1)
+        post=[call for call in self.calls if call[1] is not None][0]
+        self.assertEqual(post,('https://web.archive.org/save/',{'url':self.root,'capture_outlinks':'1','if_not_archived_within':'1,1d'},True))
+        self.assertEqual(row['state'],'outlinks-partial');self.assertEqual(row['verified_products'],0)
+        self.assertEqual(self.batch()['root_job_id'],'new-root')
+    def test_direct_pending_root_and_children_never_overwritten_or_cleared(self):
+        urls=[self.root,self.product]+[BASE+'/old-'+str(i) for i in range(19)]
+        for u in urls:self.r.state[u]={'job_id':'legacy','submitted_at':time.time()-300,'review_required':True}
+        before=json.loads(json.dumps(self.r.state));self.r.state['_queues']={'all:20261102:capture':{'cursor':5}}
+        self.c.verify.return_value=self.evidence()
+        row=self.r.run_outlink_probe()
+        for u in urls:self.assertEqual(self.r.state[u],before[u])
+        self.assertEqual(self.r.state['_queues'],{'all:20261102:capture':{'cursor':5}})
+        self.assertTrue(self.batch()['direct_pending_reference'])
+        self.assertTrue(next(iter(self.batch()['children'].values()))['direct_pending_reference'])
+        self.assertNotIn('job_id',row) # Do not mislabel legacy direct ID as new batch job.
+        self.assertEqual(self.physical_posts,1)
+    def test_mapping_retained_from_submission_pending_and_status_error(self):
+        self.post['outlinks']={self.product:'from-pending'}
+        self.status={'status':'error','job_id':'new-root','outlinks':{self.second:'from-error'},'message':'SECRET'}
+        self.r.run_outlink_probe()
+        ids={job for child in self.batch()['children'].values() for job in child['job_ids']}
+        self.assertEqual(ids,{'from-pending','from-error'})
+        self.assertEqual(self.batch()['expansion_state'],'unknown')
+        self.assertNotIn('SECRET',Path('state.json').read_text())
+    def test_external_userinfo_query_and_unknown_path_redacted(self):
+        self.status['outlinks']['https://user:SECRET@other.example/SECRET?token=SECRET']='external-job'
+        self.r.run_outlink_probe()
+        external=[c for c in self.batch()['children'].values() if c.get('hostname')=='other.example'][0]
+        self.assertNotIn('url',external);self.assertEqual(external['job_ids'],['external-job'])
+        self.assertEqual(external['coverage'],'unverifiable_redacted_url')
+        self.assertNotIn('SECRET',Path('state.json').read_text())
+        self.assertTrue(all(call.args[0].startswith(BASE) for call in self.c.verify.call_args_list))
+    def test_missing_mapping_is_unknown_not_zero_and_holds_direct_posts(self):
+        self.status={'status':'error','job_id':'new-root'}
+        row=self.r.run_outlink_probe()
+        self.assertEqual(self.batch()['expansion_state'],'unknown')
+        self.assertEqual(row['verified_products'],0)
+        held=self.r.process(self.second)
+        self.assertEqual(held['state'],'outlink-held');self.assertEqual(self.physical_posts,1)
+        self.c.json.assert_not_called()
+    def test_known_unverified_child_holds_direct_post_but_verified_child_resolves(self):
+        self.r.run_outlink_probe()
+        self.assertIn('unresolved outlink child',self.r.outlink_submission_hold(self.product))
+        child=next(iter(self.batch()['children'].values()));child['coverage']='verified';child['evidence']=self.evidence()
+        self.assertIsNone(self.r.outlink_submission_hold(self.product))
+    def test_transport_failure_never_retries_and_existing_batch_never_posts(self):
+        self.c.paced_request.side_effect=LookupFailure('SECRET',transport={'known_not_sent':False})
+        self.r.run_outlink_probe();self.assertEqual(self.c.paced_request.call_count,1)
+        self.assertEqual(self.batch()['post_state'],'outcome_unknown')
+        self.r.run_outlink_probe();self.assertEqual(self.c.paced_request.call_count,1)
+        self.assertNotIn('SECRET',Path('state.json').read_text())
+    def test_proven_not_sent_does_not_retry_or_create_global_unknown_hold(self):
+        self.c.paced_request.side_effect=LookupFailure('offline',transport={'known_not_sent':True})
+        self.r.run_outlink_probe();self.r.run_outlink_probe()
+        self.assertEqual(self.c.paced_request.call_count,1)
+        self.assertEqual(self.batch()['post_state'],'not_sent_proven')
+        self.assertIsNone(self.r.outlink_submission_hold(self.product))
+    def test_invalid_existing_journal_never_dispatches(self):
+        for journals in (None,[],{self.root:None},{self.root:{}},{self.root:{'inventory_sha256':self.digest}}):
+            self.r.state['_outlink_batches']=journals
+            row=self.r.run_outlink_probe();self.assertEqual(row['state'],'review_required')
+        self.r.recover_transport.assert_not_called();self.c.paced_request.assert_not_called()
+    def test_mismatched_root_id_retains_mapping_but_not_expansion_claim(self):
+        self.status['job_id']='unexpected-root'
+        self.r.run_outlink_probe()
+        self.assertEqual(self.batch()['root_job_id'],'new-root')
+        self.assertEqual(self.batch()['root_job_ids'],['new-root','unexpected-root'])
+        self.assertEqual(self.batch()['expansion_state'],'unknown')
+        self.assertTrue(self.batch()['children'])
+    def test_fresh_root_evidence_does_not_imply_expansion_or_child_coverage(self):
+        self.c.verify.side_effect=lambda url,*args,**kwargs:self.evidence() if url==self.root else None
+        row=self.r.run_outlink_probe()
+        self.assertEqual(self.physical_posts,1);self.assertTrue(row['root_verified'])
+        self.assertEqual(row['verified_products'],0);self.assertEqual(row['state'],'outlinks-partial')
+        self.assertTrue(self.batch()['root_evidence_before'])
+    def test_budget_interruption_preserves_child_cursor_and_readonly_resume(self):
+        from capture import RequestDeferred
+        self.status['outlinks'][self.second]='second-child';allow=False
+        def verify(url,*args,**kwargs):
+            if url==self.second and not allow:raise RequestDeferred('budget')
+            return self.evidence() if url in (self.product,self.second) else None
+        self.c.verify.side_effect=verify
+        self.r.run_outlink_probe();self.assertEqual(self.batch()['verification_cursor'],1)
+        allow=True;self.r.run_outlink_probe()
+        self.assertEqual(self.physical_posts,1);self.assertEqual(self.batch()['verification_cursor'],2)
+        self.assertTrue(all(c['coverage']=='verified' for c in self.batch()['children'].values()))
+    def test_readonly_modes_without_batch_never_healthcheck_or_submit(self):
+        for mode in ('verify_only','poll_only'):
+            setattr(self.r,mode,True);self.r.run_outlink_probe();setattr(self.r,mode,False)
+        self.r.recover_transport.assert_not_called();self.c.paced_request.assert_not_called()
+    def test_gate_or_preverification_failure_prevents_journal_post(self):
+        self.r.recover_transport.return_value=False
+        self.r.run_outlink_probe();self.c.verify.assert_not_called();self.c.paced_request.assert_not_called()
+        self.r.recover_transport.return_value=True;self.c.verify.side_effect=LookupFailure('offline')
+        self.r.run_outlink_probe();self.c.paced_request.assert_not_called()
+        self.assertNotIn(self.root,self.r.state['_outlink_batches'])
+    def test_inventory_roots_are_only_shop_all_and_products_are_frozen(self):
+        self.assertEqual(self.inventory['root_urls'],[self.root]+[self.root+'?page='+str(n) for n in range(2,7)])
+        self.assertEqual(len(self.inventory['product_urls']),154)
+        self.assertNotIn(BASE+'/pages/about-us',self.inventory['root_urls'])
+        self.assertNotIn(BASE+'/policies/legal-notice',self.inventory['root_urls'])
+    def test_success_shaped_http_error_never_releases_expansion_hold(self):
+        self.r.run_outlink_probe()
+        batch=self.batch()
+        self.r.record_outlink_response(batch,503,{},self.status,{self.product},'root_status')
+        self.assertEqual(batch['expansion_state'],'unknown')
+        self.assertTrue(batch['children']);self.assertIsNotNone(self.r.outlink_submission_hold(self.second))
+    def test_redacted_same_site_alias_child_holds_site_but_external_does_not(self):
+        self.status['outlinks']={'http://www.somervillewatchco.com/products/unknown?variant=SECRET':'alias-job'}
+        self.r.run_outlink_probe()
+        self.assertEqual(self.batch()['expansion_state'],'mapping_reported')
+        self.assertIn('redacted same-site',self.r.outlink_submission_hold(self.second))
+        self.assertNotIn('SECRET',Path('state.json').read_text())
+        child=next(iter(self.batch()['children'].values()));child['hostname']='other.example'
+        self.assertIsNone(self.r.outlink_submission_hold(self.second))
+    def test_host_pause_response_preserves_mappings_and_stops(self):
+        self.post={'job_id':'new-root','status':'error','status_ext':'error:host-crawling-paused',
+                   'outlinks':{self.product:'child-job'}}
+        row=self.r.run_outlink_probe()
+        self.assertEqual(self.physical_posts,1);self.assertEqual(len(self.calls),1)
+        self.assertEqual(self.batch()['root_job_id'],'new-root');self.assertTrue(self.batch()['children'])
+        self.assertGreater(self.r.state['_next_submit'],time.time()+650)
+        self.assertEqual(row['state'],'outlinks-partial')
+
+    def test_nonjson_429_stops_with_host_cooldown_without_more_requests(self):
+        def refused(url,data=None,authenticated=False):
+            self.assertIsNotNone(data)
+            self.physical_posts+=1
+            self.c.post_attempt_callback({'attempt':1,'started_at':time.time()})
+            return 429,{},'SECRET html refusal',url
+        self.c.paced_request.side_effect=refused
+        row=self.r.run_outlink_probe()
+        self.assertEqual(self.physical_posts,1);self.assertEqual(self.c.paced_request.call_count,1)
+        self.assertEqual(self.c.verify.call_count,1) # Only pre-POST evidence check.
+        self.assertGreater(self.r.state['_next_submit'],time.time()+650)
+        self.assertEqual(self.batch()['expansion_state'],'unknown')
+        self.assertEqual(row['state'],'outlinks-partial')
+        self.assertNotIn('SECRET',Path('state.json').read_text())
+
+    def test_scope_only_fixed_probe_budget_and_no_discovery_or_broad_queue(self):
+        from capture import main
+        with patch('sys.argv',['capture.py','--scope','outlink_probe']),patch('capture.Runner') as runner,patch('capture.discover') as discover,patch('capture.discover_supplemental') as supplemental:
+            runner.return_value.run_outlink_probe.return_value={'state':'outlinks-partial'}
+            self.assertEqual(main(),1);self.assertEqual(runner.call_args.args[2],1800)
+            runner.return_value.run_outlink_probe.assert_called_once_with()
+            runner.return_value.run_queue.assert_not_called();discover.assert_not_called();supplemental.assert_not_called()
+
 class WorkflowTests(unittest.TestCase):
     def test_operational_artifact_is_explicit_and_tests_are_isolated(self):
         workflow = (Path(__file__).resolve().parent / '.github/workflows/wayback-snapshot.yml').read_text()

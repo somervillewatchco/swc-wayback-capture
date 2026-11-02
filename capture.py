@@ -3,6 +3,7 @@
 import argparse
 import datetime as dt
 import gzip
+import hashlib
 import html
 import http.client
 import json
@@ -24,6 +25,7 @@ PRIORITY = ['/', '/policies/refund-policy', '/policies/shipping-policy',
 TRANSPORT_PROBE = BASE + '/products/date-mod-ice-blue-arabic-watch'
 PACING_PROBE = BASE + '/products/date-mod-olive-green-watch'
 SUPPLEMENTAL_PROBE = BASE + '/pages/about-us'
+OUTLINK_PROBE = BASE + '/collections/all'
 UTC = dt.timezone.utc
 
 def timestamp(epoch):
@@ -39,6 +41,44 @@ def identity(url):
     if p.scheme not in ('http', 'https') or p.hostname not in ('somervillewatchco.com', 'www.somervillewatchco.com'):
         return None
     return (p.path.rstrip('/') or '/', tuple(sorted(up.parse_qsl(p.query, keep_blank_values=True))))
+
+def load_outlink_inventory():
+    path = Path(__file__).with_name('outlink_inventory.json')
+    obj = json.loads(path.read_text())
+    roots, products = obj.get('root_urls'), obj.get('product_urls')
+    if not isinstance(roots, list) or not 1 <= len(roots) <= 20:
+        raise LookupFailure('Invalid frozen Shop All root inventory')
+    expected = [OUTLINK_PROBE] + [OUTLINK_PROBE + '?page=' + str(i) for i in range(2, len(roots)+1)]
+    if roots != expected:
+        raise LookupFailure('Outlink roots must be exact Shop All pagination; no other roots allowed')
+    if (not isinstance(products, list) or not 1 <= len(products) <= 5000
+        or len(set(products)) != len(products)
+        or any(not isinstance(u, str) or not re.fullmatch(re.escape(BASE) + r'/products/[a-z0-9][a-z0-9-]*', u) for u in products)):
+        raise LookupFailure('Invalid frozen public product inventory')
+    canonical = {'root_urls': roots, 'product_urls': products}
+    digest = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+    return canonical, digest
+
+
+def outlink_child_reference(raw_url, known):
+    """Unknown/external paths, queries and userinfo are never persisted."""
+    if not isinstance(raw_url, str):
+        return None
+    digest = hashlib.sha256(raw_url.encode()).hexdigest()
+    reference = {'url_sha256': digest}
+    try:
+        parsed = up.urlsplit(raw_url)
+        if parsed.scheme not in ('http', 'https'):
+            return reference
+        host = parsed.hostname
+        if isinstance(host, str) and re.fullmatch(r'[a-z0-9.-]{1,253}', host):
+            reference['hostname'] = host
+        if raw_url in known and parsed.username is None and parsed.password is None:
+            reference['url'] = raw_url
+    except ValueError:
+        pass
+    return reference
+
 
 def safe_status_ext(value):
     allowed = {'error:' + name for name in (
@@ -625,8 +665,8 @@ class Runner:
                 row[key] = pending[key]
         return row
 
-    def result(self, url, state, **extra):
-        row = {'url': url, 'state': state, **extra, **self.diagnostic_snapshot(url)}
+    def result(self, url, state, include_pending=True, **extra):
+        row = {'url': url, 'state': state, **extra, **(self.diagnostic_snapshot(url) if include_pending else {})}
         self.results.append(row)
         print(json.dumps(row), flush=True)
         Path('capture-report.json').write_text(json.dumps(self.results, indent=2))
@@ -867,6 +907,190 @@ class Runner:
         for url in queue['urls'][queue['cursor']:]:
             self.result(url, 'deferred', reason='untouched queue checkpoint saved; recovery cycles or run budget exhausted')
 
+    def outlink_submission_hold(self, url):
+        journals = self.state.get('_outlink_batches', {})
+        if not isinstance(journals, dict):
+            return 'outlink journal needs review; no direct submission'
+        for batch in journals.values():
+            if not isinstance(batch, dict):
+                return 'outlink journal needs review; no direct submission'
+            sent = batch.get('post_state') in ('dispatch_started', 'response_received', 'outcome_unknown')
+            if sent and batch.get('expansion_state') != 'mapping_reported' and identity(url):
+                return 'outlink expansion unknown; run outlink_probe --verify-only, then obtain reviewed resolution if still unknown'
+            for child in batch.get('children', {}).values():
+                if (not child.get('url') and child.get('hostname') in ('somervillewatchco.com', 'www.somervillewatchco.com')
+                    and child.get('job_ids') and child.get('coverage') != 'verified' and identity(url)):
+                    return 'unresolved redacted same-site outlink; read-only reconciliation and reviewed resolution required before direct submissions'
+                matches = child.get('url') == url or child.get('url_sha256') == hashlib.sha256(url.encode()).hexdigest()
+                if matches and child.get('job_ids') and child.get('coverage') != 'verified':
+                    return 'unresolved outlink child job; run outlink_probe --verify-only, no automatic duplicate submission'
+        return None
+
+    def record_outlink_response(self, batch, code, headers, obj, known, phase):
+        # Persist valid mappings BEFORE interpreting status or doing another IO.
+        detail = response_metadata(code, headers, obj if isinstance(obj, dict) else {})
+        detail.update(phase=phase, checked_at=timestamp(time.time()), schema_valid=isinstance(obj, dict))
+        batch['responses'] = (batch.get('responses', []) + [detail])[-12:]
+        batch['expansion_state'] = 'unknown'
+        if isinstance(obj, dict):
+            job = obj.get('job_id')
+            if isinstance(job, str) and re.fullmatch(r'[A-Za-z0-9_-]+', job):
+                ids = batch.setdefault('root_job_ids', [])
+                if job not in ids:
+                    ids.append(job)
+                if not batch.get('root_job_id'):
+                    batch['root_job_id'] = job
+                detail['root_job_id_matches'] = job == batch['root_job_id']
+            mapping = obj.get('outlinks')
+            detail['outlinks_present'] = 'outlinks' in obj
+            detail['mapping_valid_shape'] = isinstance(mapping, dict)
+            if isinstance(mapping, dict):
+                detail['reported_mapping_count'] = len(mapping)
+                detail['mapping_truncated'] = len(mapping) > 100
+                valid = 0
+                for raw_url, value in list(mapping.items())[:100]:
+                    child_job = value.get('job_id') if isinstance(value, dict) else value
+                    if not isinstance(child_job, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', child_job):
+                        continue
+                    reference = outlink_child_reference(raw_url, known)
+                    if reference is None:
+                        continue
+                    key = reference['url_sha256']
+                    child = batch['children'].setdefault(key, {**reference, 'job_ids': [], 'coverage': 'unverified'})
+                    if child_job not in child['job_ids']:
+                        child['job_ids'].append(child_job)
+                    child['direct_pending_reference'] = raw_url in self.state
+                    if key not in batch['child_order']:
+                        batch['child_order'].append(key)
+                    valid += 1
+                detail['valid_child_mappings'] = valid
+                matching_job = 'job_id' not in obj or obj.get('job_id') == batch.get('root_job_id')
+                if code == 200 and obj.get('status') == 'success' and matching_job and 0 < valid == len(mapping) <= 100:
+                    batch['expansion_state'] = 'mapping_reported'  # Not capture coverage or completeness.
+            batch['root_reported_status'] = obj.get('status') if obj.get('status') in ('success', 'pending', 'error') else 'unknown'
+        self.save()
+        if self.pause(headers, {**(obj if isinstance(obj, dict) else {}), '_http': code}):
+            batch['expansion_state'] = 'unknown'
+            batch['server_paused_until'] = self.next_submit
+            self.save()
+            return True
+        return False
+
+    def outlink_report(self, batch, inventory, reason):
+        products = set(inventory['product_urls'])
+        mapped = {child.get('url') for child in batch['children'].values() if child.get('url') in products}
+        verified = {child.get('url') for child in batch['children'].values()
+                    if child.get('url') in products and child.get('coverage') == 'verified'}
+        root_verified = bool(batch.get('root_evidence'))
+        complete = root_verified and len(verified) == len(products)
+        return self.result(OUTLINK_PROBE, 'outlinks-verified' if complete else 'outlinks-partial',
+            include_pending=False, reason=reason, root_verified=root_verified, expected_products=len(products),
+            mapped_products=len(mapped), verified_products=len(verified),
+            unreported_products=len(products - mapped), expansion_attribution='unproven', outlink_batch=batch)
+
+    def run_outlink_probe(self):
+        """One physical root POST total; subsequent invocations are read-only."""
+        try:
+            inventory, digest = load_outlink_inventory()
+        except (LookupFailure, ValueError, OSError, TypeError):
+            return self.result(OUTLINK_PROBE, 'review_required', reason='frozen outlink inventory invalid; no request made')
+        known = set(inventory['root_urls'] + inventory['product_urls'] + [BASE+p for p in PRIORITY])
+        journals = self.state.setdefault('_outlink_batches', {})
+        if not isinstance(journals, dict):
+            return self.result(OUTLINK_PROBE, 'review_required', reason='outlink journal invalid; no request made')
+        exists = OUTLINK_PROBE in journals
+        batch = journals.get(OUTLINK_PROBE)
+        if exists and (not isinstance(batch, dict) or batch.get('inventory_sha256') != digest
+                or batch.get('root_url') != OUTLINK_PROBE
+                or not isinstance(batch.get('children'), dict)
+                or not isinstance(batch.get('child_order'), list)
+                or any(key not in batch['children'] for key in batch['child_order'])
+                or not isinstance(batch.get('verification_cursor'), int)
+                or not 0 <= batch['verification_cursor'] <= len(batch['child_order'])
+                or not isinstance(batch.get('utc_day'), (int, float))
+                or not 0 < batch['utc_day'] <= time.time() + 86400):
+            return self.result(OUTLINK_PROBE, 'review_required', reason='outlink journal/inventory mismatch; no request made')
+        if not exists:
+            if self.verify_only or self.poll_only:
+                return self.result(OUTLINK_PROBE, 'outlinks-partial', reason='no saved outlink batch; read-only mode never submits')
+            if not self.recover_transport(cycle=1):
+                return self.result(OUTLINK_PROBE, 'deferred', reason='mandatory paced health gate failed; no outlink submission')
+            try:
+                before = self.client.verify(OUTLINK_PROBE, self.since)
+            except (LookupFailure, ValueError, OSError):
+                return self.result(OUTLINK_PROBE, 'deferred', reason='pre-submission archive evidence unavailable; no outlink submission')
+            batch = {'root_url': OUTLINK_PROBE, 'inventory_sha256': digest,
+                     'utc_day': self.since, 'created_at': time.time(), 'root_evidence_before': before,
+                     'direct_pending_reference': OUTLINK_PROBE in self.state,
+                     'request': {'capture_outlinks': '1', 'if_not_archived_within': '1,1d'},
+                     'post_state': 'not_dispatched', 'expansion_state': 'unknown',
+                     'children': {}, 'child_order': [], 'verification_cursor': 0, 'responses': []}
+            journals[OUTLINK_PROBE] = batch
+            self.save()  # Atomic journal BEFORE any potentially accepted root POST.
+            old_callback = self.client.post_attempt_callback
+            def record_attempt(attempt):
+                batch['post_state'] = 'dispatch_started'
+                batch['attempt'] = attempt
+                self.save()
+            self.client.post_attempt_callback = record_attempt
+            try:
+                code, headers, body, _ = self.client.paced_request('https://web.archive.org/save/',
+                    {'url': OUTLINK_PROBE, 'capture_outlinks': '1', 'if_not_archived_within': '1,1d'}, True)
+                try:
+                    obj = json.loads(body)
+                except (ValueError, TypeError):
+                    obj = None
+                batch['post_state'] = 'response_received'
+                if self.record_outlink_response(batch, code, {k.lower():v for k,v in headers.items()}, obj, known, 'submission'):
+                    return self.outlink_report(batch, inventory, 'server paused submission; IDs retained, no further requests')
+            except (LookupFailure, ValueError, OSError) as exc:
+                proof = getattr(exc, 'transport', None) or {}
+                batch['post_state'] = ('not_dispatched_budget' if isinstance(exc, RequestDeferred) else
+                    'not_sent_proven' if proof.get('known_not_sent') is True else 'outcome_unknown')
+                batch['expansion_state'] = 'unknown'
+                batch['submission_error_class'] = type(exc).__name__
+                self.save()
+                return self.outlink_report(batch, inventory, 'root submission unresolved; journal retained, no automatic retry')
+            finally:
+                self.client.post_attempt_callback = old_callback
+        # Existing batch, including no-ID or proven-unsent outcomes, never POSTs.
+        try:
+            job = batch.get('root_job_id')
+            if isinstance(job, str) and re.fullmatch(r'[A-Za-z0-9_-]+', job):
+                code, headers, body, _ = self.client.paced_request('https://web.archive.org/save/status/'+job, authenticated=True)
+                try:
+                    obj = json.loads(body)
+                except (ValueError, TypeError):
+                    obj = None
+                if self.record_outlink_response(batch, code, {k.lower():v for k,v in headers.items()}, obj, known, 'root_status'):
+                    return self.outlink_report(batch, inventory, 'server paused status lookup; IDs retained, no further requests')
+            start, end = batch['utc_day'], batch['utc_day'] + 86400 - 1
+            evidence = self.client.verify(OUTLINK_PROBE, start, until=end)
+            if evidence:
+                batch['root_evidence'] = evidence
+                batch['root_capture_after_attempt'] = bool(batch.get('attempt')) and epoch(evidence['timestamp']) >= batch['attempt']['started_at'] - 5
+                self.save()
+            order = batch['child_order']
+            if batch['verification_cursor'] >= len(order):
+                batch['verification_cursor'] = 0  # A later read-only pass can resolve indexing lag.
+            while batch['verification_cursor'] < len(order):
+                child = batch['children'][order[batch['verification_cursor']]]
+                if child.get('url') in known:
+                    evidence = self.client.verify(child['url'], start, until=end)
+                    child['coverage'] = 'verified' if evidence else 'unverified'
+                    if evidence:
+                        child['evidence'] = evidence
+                else:
+                    child['coverage'] = 'unverifiable_redacted_url'
+                batch['verification_cursor'] += 1
+                self.save()
+        except (LookupFailure, ValueError, OSError) as exc:
+            batch['verification_interrupted'] = type(exc).__name__
+            batch['expansion_state'] = 'unknown'
+            self.save()
+            return self.outlink_report(batch, inventory, 'partial read-only verification; IDs and cursor retained')
+        return self.outlink_report(batch, inventory, 'root and child evidence assessed separately; no completeness inferred from root success')
+
     def run_supplemental_probe(self):
         """One fixed untouched canary; never release an unexpected prior attempt."""
         url = SUPPLEMENTAL_PROBE
@@ -969,6 +1193,9 @@ class Runner:
             evidence = self.client.verify(url, self.since)
             if evidence:
                 return self.verified_result(url, evidence, 'existing_index')
+            hold = self.outlink_submission_hold(url)
+            if hold:
+                return self.result(url, 'outlink-held', reason=hold)
             pending = self.state.get(url)
             created_pending = False
             if pending and pending.get('known_not_sent') is True and not pending.get('job_id') and not (self.verify_only or self.poll_only):
@@ -1147,7 +1374,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--verify-only', action='store_true')
     mode.add_argument('--poll-only', action='store_true', help='Read existing job status and archive evidence; never submit')
-    parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental', 'transport_probe', 'pacing_probe', 'pacing_job_diagnostic', 'account_diagnostic', 'supplemental_probe'), default='all')
+    parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental', 'transport_probe', 'pacing_probe', 'pacing_job_diagnostic', 'account_diagnostic', 'supplemental_probe', 'outlink_probe'), default='all')
     parser.add_argument('--state', default='.capture-state/pending.json')
     mode.add_argument('--inspect-state', action='store_true', help='Emit sanitized saved-state summary only; no network or state mutation')
     parser.add_argument('--budget', type=int, default=17400)
@@ -1163,8 +1390,12 @@ def main():
         print(json.dumps(summary), flush=True)
         return 0
     client = Client()
-    budget = min(args.budget, 1800) if args.scope in ('pacing_probe', 'pacing_job_diagnostic', 'account_diagnostic', 'supplemental_probe') else args.budget
+    budget = min(args.budget, 1800) if args.scope in ('pacing_probe', 'pacing_job_diagnostic', 'account_diagnostic', 'supplemental_probe', 'outlink_probe') else args.budget
     runner = Runner(client, args.state, budget, verify_only=args.verify_only, poll_only=args.poll_only)
+    if args.scope == 'outlink_probe':
+        row = runner.run_outlink_probe()
+        print('Outlink expansion and child coverage are separate; partial is not complete.')
+        return 0 if row['state'] == 'outlinks-verified' else 1
     if args.scope == 'account_diagnostic':
         row = runner.diagnose_account()
         print('Read-only possibly-cached account-capacity observation; not authentication proof or capture coverage.')

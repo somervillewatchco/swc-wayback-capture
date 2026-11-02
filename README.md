@@ -238,3 +238,65 @@ The canary has its own scope/day/mode checkpoint and does not advance, prune or
 replace another scope's queue, including the existing all-scope cursor and prior
 probes. Passing health checks does not establish capture coverage or prove that
 the previously observed failure is fixed. Throughput limitations remain unchanged.
+
+### Bounded Shop All outlinks canary (separate journal)
+
+The approved outlink roots are **only** the frozen paginated Shop All URLs in
+`outlink_inventory.json`: `/collections/all`, then `?page=2` through `?page=6`.
+The same public snapshot records154 product URLs for independent coverage checks.
+About Us, policies, cart and named collections are **not outlink roots**. Policy
+and cart captures remain separate direct requests with no outlinks option. Archive
+may nevertheless discover those pages or external domains as children: its API
+has no documented same-site exclusion filter, so this implementation cannot promise
+that those incidental child captures are excluded.
+
+Only `--scope outlink_probe` is executable now: fixed first root
+`https://somervillewatchco.com/collections/all`, maximum30-minute budget. The other
+five root URLs are a reviewed inventory, not an active bulk submission mode. First
+validate the canary's evidence before implementing/dispatching the remaining roots.
+The mandatory existing two-pass paced health gate and strict pre-CDX/replay check
+run first. Existing root coverage is recorded separately and does not imply
+outlink expansion; the approved duplicate-risk test may still submit once.
+
+The one root POST uses only `url`, `capture_outlinks=1`, and
+`if_not_archived_within=1,1d` (root1second; children1day). Child freshness reduces
+some repeats but does not guarantee exclusion of existing captures. There is
+**exactly one physical POST**, via the globally paced request primitive without
+its retry orchestrator—even a proven-unsent failure is not automatically retried.
+No child POSTs, additional capture options, auth/UA changes or new credentials.
+
+An isolated `_outlink_batches` journal is atomically saved before that POST. Root
+job IDs and valid child mappings are retained from every response, including
+pending/error replies, before another request. Mapping shape/size anomalies,
+absent mappings, failures and empty responses remain expansion-unknown, never
+silently “zero captured.” A response is expected to contain at most100 mappings;
+unexpected larger responses are explicitly marked truncated/unknown, not complete.
+Legacy direct pending records—including the existing root record—are referenced,
+not overwritten or cleared. Existing batch entries, even malformed or no-ID
+entries, never trigger another automatic root POST. Later invocations of the same
+scope are read-only; `--verify-only`/`--poll-only` never create a new batch.
+
+Known public inventory URLs can be retained and verified. Other child URLs retain
+only a SHA256 reference, safe hostname and validated job IDs: no path, query,
+userinfo or raw server text is logged. Such redacted external children remain
+unverified. Root coverage, each child's coverage, mapped products, verified products
+and unreported products are separate. A root success response does not establish
+any child's capture; every verified child requires exact CDX plus usable exact
+replay for the batch's initial UTC day. A saved cursor allows later read-only
+verification to continue after budget exhaustion. A partial canary exits incomplete;
+it does not assert that154 products—or even every discovered child—were captured.
+Coverage timestamps alone do not establish that this batch caused the captures.
+
+Ordinary direct runs perform their independent archive check first, then consult
+these journals before submitting. Unresolved known child IDs hold their matching
+URL. A potentially accepted root with unknown expansion, or any unresolved redacted
+same-site child/alias, conservatively holds same-site direct submissions. These
+are **protected, not covered** results and do not change legacy pending records.
+Reconcile using `--scope outlink_probe --verify-only`; if IDs/maps or redacted
+same-site links remain unresolved, explicit reviewed resolution is required before
+releasing the hold. No automatic expiry, journal deletion or blind resubmission is
+provided. This may reduce scheduled throughput while uncertainty is unresolved.
+
+The120-second global request floor, server cooldowns, strict evidence requirements
+and previously documented daily-throughput limitation remain unchanged. Outlinks
+may create captures in parallel, but independent verification still takes time.
