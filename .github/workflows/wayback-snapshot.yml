@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       scope:
-        description: 'Capture scope (pilot is warranty only)'
+        description: 'Capture scope (supplemental = sitemap pages outside all-scope inventory)'
         type: choice
-        options: [pilot, priority, all]
+        options: [pilot, priority, all, supplemental]
         default: pilot
       verify_only:
         description: 'Read archive evidence without submitting captures'
