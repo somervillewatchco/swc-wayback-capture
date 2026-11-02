@@ -190,3 +190,27 @@ Freshness/new-capture classification now uses the last valid physical attempt's
 A capture that predates the paced actual submission may establish existing daily
 coverage, but is not labeled a new capture attributable to that attempt. Timing
 alone still does not establish that this particular job caused the capture.
+
+### One read-only account-capacity observation
+
+Manual scope `account_diagnostic` performs exactly one paced authenticated GET to
+`https://web.archive.org/save/status/user`, with no query, POST, retry, inventory,
+CDX/replay, queue processing or job clearing. It uses the existing credentials and
+unchanged endpoint allowlist; no authentication/security configuration changes.
+The global gate/cooldowns and30-minute bound apply. Only pacing metadata and a
+sanitized `_account_diagnostic` observation are saved; pending jobs/review flags
+and queue contents are unchanged, regardless of the verify checkbox.
+
+The documented `available`/`processing` counters are retained only as nonnegative
+integers (booleans rejected); both are required for a valid schema. Optional
+`daily_captures`/`daily_captures_limit` are retained only if valid integers but are
+not documented by the supplied endpoint example. Missing or invalid fields are
+unknown, not zero. No account identity, raw response, message or headers are stored.
+Only validated integer Age and canonical RFC Date metadata may accompany counts.
+
+Official documentation warns this no-query endpoint can return cached data.
+`cache_freshness=unknown` when either usable Date or Age is absent;
+`reported_headers_only` means both headers were parsed, **not** that freshness was
+established. HTTP200/valid schema does not independently prove current credentials
+work or that capacity existed at a previous capture failure. This observation
+cannot explain a past reported400 by itself and never counts as verified coverage.

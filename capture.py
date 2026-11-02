@@ -126,6 +126,33 @@ def job_observation(http_status, headers, obj, url, pending):
     return observation
 
 
+def account_observation(http_status, headers, obj):
+    """Capacity counters only; never echo account identity or response text."""
+    result = {'http_status': http_status, 'checked_at': timestamp(time.time()), 'schema_valid': False,
+              'cache_freshness': 'unknown'}
+    if isinstance(obj, dict):
+        for key in ('available', 'processing', 'daily_captures', 'daily_captures_limit'):
+            value = obj.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                result[key] = value
+        result['schema_valid'] = 'available' in result and 'processing' in result
+    age = headers.get('age')
+    if isinstance(age, str) and re.fullmatch(r'[0-9]{1,20}', age.strip()):
+        result['response_age_seconds'] = int(age.strip())
+    date = headers.get('date')
+    if isinstance(date, str):
+        from email.utils import parsedate_to_datetime, format_datetime
+        try:
+            parsed = parsedate_to_datetime(date)
+            if parsed.tzinfo is not None:
+                result['response_date'] = format_datetime(parsed.astimezone(UTC), usegmt=True)
+        except (ValueError, TypeError, OverflowError):
+            pass
+    if 'response_age_seconds' in result and 'response_date' in result:
+        result['cache_freshness'] = 'reported_headers_only'
+    return result
+
+
 def safe_recovery_event(event):
     result = {}
     for key in ('cycle', 'pass_number', 'http_status', 'errno', 'cooldown_until', 'retry_after_until'):
@@ -837,6 +864,36 @@ class Runner:
         for url in queue['urls'][queue['cursor']:]:
             self.result(url, 'deferred', reason='untouched queue checkpoint saved; recovery cycles or run budget exhausted')
 
+    def diagnose_account(self):
+        """Exactly one gated existing-auth GET; no capture/job/queue operations."""
+        url = 'https://web.archive.org/save/status/user'
+        try:
+            code, headers, body, _ = self.client.paced_request(url, authenticated=True)
+            try:
+                obj = json.loads(body)
+            except (ValueError, TypeError):
+                obj = None
+            observation = account_observation(code, {k.lower(): v for k, v in headers.items()}, obj)
+            self.state['_account_diagnostic'] = observation
+            self.save()
+            state = 'diagnostic-observed' if code == 200 and observation['schema_valid'] else 'diagnostic-unavailable'
+            return self.result(url, state, account_observation=observation,
+                reason='single possibly-cached account-capacity observation; not capture coverage or historical failure attribution')
+        except RequestDeferred:
+            return self.result(url, 'deferred', reason='account diagnostic pacing/cooldown exceeds budget; no request made')
+        except LookupFailure as exc:
+            observation = {'checked_at': timestamp(time.time()), 'schema_valid': False,
+                           'outcome': 'lookup_failed', 'error_class': type(exc).__name__}
+            detail = exc.transport if isinstance(exc.transport, dict) else {}
+            safe = safe_recovery_event({'transport_phase': detail.get('phase'),
+                'reason_class': detail.get('reason_class'), 'errno': detail.get('errno')})
+            if safe:
+                observation['transport'] = safe
+            self.state['_account_diagnostic'] = observation
+            self.save()
+            return self.result(url, 'diagnostic-unavailable', account_observation=observation,
+                               reason='single account status lookup failed; no retry or capture action')
+
     def diagnose_saved_pacing_job(self):
         """Exactly one gated authenticated status GET; never verify/submit/retire."""
         url = PACING_PROBE
@@ -1059,7 +1116,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--verify-only', action='store_true')
     mode.add_argument('--poll-only', action='store_true', help='Read existing job status and archive evidence; never submit')
-    parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental', 'transport_probe', 'pacing_probe', 'pacing_job_diagnostic'), default='all')
+    parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental', 'transport_probe', 'pacing_probe', 'pacing_job_diagnostic', 'account_diagnostic'), default='all')
     parser.add_argument('--state', default='.capture-state/pending.json')
     mode.add_argument('--inspect-state', action='store_true', help='Emit sanitized saved-state summary only; no network or state mutation')
     parser.add_argument('--budget', type=int, default=17400)
@@ -1075,8 +1132,12 @@ def main():
         print(json.dumps(summary), flush=True)
         return 0
     client = Client()
-    budget = min(args.budget, 1800) if args.scope in ('pacing_probe', 'pacing_job_diagnostic') else args.budget
+    budget = min(args.budget, 1800) if args.scope in ('pacing_probe', 'pacing_job_diagnostic', 'account_diagnostic') else args.budget
     runner = Runner(client, args.state, budget, verify_only=args.verify_only, poll_only=args.poll_only)
+    if args.scope == 'account_diagnostic':
+        row = runner.diagnose_account()
+        print('Read-only possibly-cached account-capacity observation; not authentication proof or capture coverage.')
+        return 0 if row['state'] == 'diagnostic-observed' else 1
     if args.scope == 'pacing_job_diagnostic':
         row = runner.diagnose_saved_pacing_job()
         print('Read-only saved-job observation only; not capture coverage.')

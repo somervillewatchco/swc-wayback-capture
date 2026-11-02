@@ -1341,6 +1341,68 @@ class GlobalArchivePacingTests(unittest.TestCase):
                 runner.return_value.diagnose_saved_pacing_job.assert_called_once_with()
                 runner.return_value.run_queue.assert_not_called();discover.assert_not_called();supplemental.assert_not_called()
 
+    def test_account_diagnostic_one_authenticated_get_preserves_jobs_and_queues(self):
+        self.r.state[URL]={'job_id':'saved-job','submitted_at':self.now-900,'review_required':True}
+        self.r.state['_queues']={'all:20261102:capture':{'cursor':5,'complete':False}}
+        before=json.loads(json.dumps(self.r.state))
+        self.c._request.side_effect=None
+        self.c._request.return_value=(200,{'Age':'15','Date':'Mon, 02 Nov 2026 15:00:00 GMT'},
+            json.dumps({'available':12,'processing':3,'daily_captures':11,'daily_captures_limit':100,
+                        'email':'SECRET@example.invalid','user':'SECRET','message':'SECRET'}),'unused')
+        row=self.r.diagnose_account()
+        self.c._request.assert_called_once_with('https://web.archive.org/save/status/user',None,True)
+        self.assertEqual(row['state'],'diagnostic-observed')
+        data=row['account_observation']
+        self.assertEqual(data['available'],12);self.assertEqual(data['processing'],3)
+        self.assertEqual(data['response_age_seconds'],15)
+        self.assertEqual(data['response_date'],'Mon, 02 Nov 2026 15:00:00 GMT')
+        self.assertEqual(data['cache_freshness'],'reported_headers_only')
+        self.assertTrue(data['schema_valid'])
+        self.assertEqual(self.r.state[URL],before[URL]);self.assertEqual(self.r.state['_queues'],before['_queues'])
+        self.assertNotIn('SECRET',Path('state.json').read_text()+json.dumps(row))
+    def test_account_schema_rejects_bool_negative_noninteger_unknown_quota(self):
+        from capture import account_observation
+        data=account_observation(200,{}, {'available':12,'processing':3})
+        self.assertTrue(data['schema_valid']);self.assertEqual(data['cache_freshness'],'unknown');self.assertNotIn('daily_captures',data)
+        self.assertNotIn('daily_captures_limit',data)
+        for bad in (True,False,-1,1.5,'12',None):
+            data=account_observation(200,{}, {'available':bad,'processing':3,'daily_captures_limit':bad})
+            self.assertFalse(data['schema_valid'])
+            self.assertNotIn('available',data);self.assertNotIn('daily_captures_limit',data)
+    def test_account_headers_and_secret_fields_are_strictly_redacted(self):
+        from capture import account_observation
+        for body in (None,[],{'available':12,'processing':True,'id':'SECRET','token':'SECRET'}):
+            data=account_observation(200,{'age':'SECRET','date':'SECRET'},body)
+            self.assertFalse(data['schema_valid']);self.assertNotIn('response_age_seconds',data)
+            self.assertNotIn('response_date',data);self.assertNotIn('SECRET',json.dumps(data))
+        for age in ('-1','1.5','true','9999999999999999999999999999'):
+            self.assertNotIn('response_age_seconds',account_observation(200,{'age':age},{}))
+    def test_account_error_response_observed_once_with_cooldown_no_retry(self):
+        self.c._request.side_effect=None
+        self.c._request.return_value=(503,{'Retry-After':'900'},'{"message":"SECRET","available":12,"processing":3}','unused')
+        row=self.r.diagnose_account()
+        self.assertEqual(row['state'],'diagnostic-unavailable');self.assertEqual(self.c._request.call_count,1)
+        self.assertGreaterEqual(self.r.state['_archive_next_request_at'],self.now+900)
+        self.assertNotIn('SECRET',json.dumps(row))
+    def test_account_transport_failure_single_call_safe_metadata(self):
+        self.c._request.side_effect=LookupFailure('SECRET',transport={'phase':'read','reason_class':'TimeoutError','errno':110})
+        row=self.r.diagnose_account()
+        self.assertEqual(self.c._request.call_count,1);self.assertEqual(row['state'],'diagnostic-unavailable')
+        self.assertEqual(row['account_observation']['transport']['errno'],110)
+        self.assertNotIn('SECRET',json.dumps(row))
+    def test_account_diagnostic_budget_zero_network(self):
+        self.c.archive_next_request_at=self.now+900;self.c.archive_deadline=self.now+300
+        self.assertEqual(self.r.diagnose_account()['state'],'deferred');self.c._request.assert_not_called()
+    def test_account_scope_early_return_all_flags_no_inventory_queue_or_submission(self):
+        from capture import main
+        for flags in ([],['--verify-only'],['--poll-only']):
+            with patch('sys.argv',['capture.py','--scope','account_diagnostic']+flags),patch('capture.Runner') as runner,patch('capture.discover') as discover,patch('capture.discover_supplemental') as supplemental:
+                runner.return_value.diagnose_account.return_value={'state':'diagnostic-observed'}
+                self.assertEqual(main(),0);self.assertEqual(runner.call_args.args[2],1800)
+                runner.return_value.diagnose_account.assert_called_once_with()
+                runner.return_value.run_queue.assert_not_called();runner.return_value.process.assert_not_called()
+                discover.assert_not_called();supplemental.assert_not_called()
+
     def test_health_requests_obey_same_gate(self):
         def health(url,*args):
             self.calls.append((url,None,self.now));self.now+=5
