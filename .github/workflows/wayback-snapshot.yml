@@ -37,7 +37,11 @@ jobs:
         with:
           python-version: '3.12'
       - name: Offline regression tests
-        run: env -u GITHUB_STEP_SUMMARY python -m unittest -v test_capture test_diagnose_transport
+        run: |
+          test_dir=$(mktemp -d)
+          trap 'rm -rf "$test_dir"' EXIT
+          cd "$test_dir"
+          env -u GITHUB_STEP_SUMMARY PYTHONPATH="$GITHUB_WORKSPACE" python -m unittest -v test_capture test_diagnose_transport
       - name: Restore unresolved jobs and host cooldown
         if: ${{ !inputs.diagnostic }}
         uses: actions/cache/restore@v4
@@ -72,7 +76,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: capture-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: capture-report.json
+          path: |
+            capture-report.json
+            operational-report.json
           if-no-files-found: warn
           retention-days: 90
       - name: Public read-only transport diagnostics
