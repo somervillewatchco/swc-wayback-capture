@@ -1,0 +1,22 @@
+name: Temporary Wayback scheduler heartbeat
+on:
+  schedule:
+    - cron: '7 17 2 11 *'
+  workflow_dispatch: {}
+permissions: {}
+jobs:
+  local-heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Print local UTC and event only within the fixed diagnostic window
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          if [[ "$now" < "2026-11-02T00:00:00Z" || "$now" > "2026-11-03T01:30:00Z" ]]; then
+            printf 'Heartbeat expired; no diagnostic work. UTC=%s event=%s\n' "$now" "$EVENT_NAME"
+            exit 0
+          fi
+          printf 'Scheduler heartbeat UTC=%s event=%s\n' "$now" "$EVENT_NAME"
