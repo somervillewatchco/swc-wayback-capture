@@ -434,6 +434,30 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.r.process(URL)['state'], 'review_required')
         self.assertEqual(self.r.state[URL]['job_id'], 'saved-job')
 
+    def test_catalog_page_two_canonical_matches_requested_query(self):
+        page1 = GOOD + '<link rel="canonical" href="' + BASE + '/collections/all"><a href="/products/first">First</a><a href="?page=2">Next</a>'
+        page2 = GOOD + '<link rel="canonical" href="' + BASE + '/collections/all?page=2"><a href="/products/second">Second</a>'
+        self.c.request.side_effect = [(200, {}, page1, BASE + '/collections/all'),
+                                     (200, {}, page2, BASE + '/collections/all?page=2')]
+        self.assertEqual(discover(self.c), [BASE + '/collections/all', BASE + '/collections/all?page=2',
+                                          BASE + '/products/first', BASE + '/products/second'])
+
+    def test_catalog_page_two_wrong_final_query_rejected(self):
+        page1 = GOOD + '<a href="/products/first">First</a><a href="?page=2">Next</a>'
+        page2 = GOOD + '<link rel="canonical" href="' + BASE + '/collections/all?page=2"><a href="/products/second">Second</a>'
+        self.c.request.side_effect = [(200, {}, page1, BASE + '/collections/all'),
+                                     (200, {}, page2, BASE + '/collections/all')]
+        with self.assertRaises(LookupFailure):
+            discover(self.c)
+
+    def test_catalog_page_two_wrong_canonical_query_rejected(self):
+        page1 = GOOD + '<a href="/products/first">First</a><a href="?page=2">Next</a>'
+        page2 = GOOD + '<link rel="canonical" href="' + BASE + '/collections/all"><a href="/products/second">Second</a>'
+        self.c.request.side_effect = [(200, {}, page1, BASE + '/collections/all'),
+                                     (200, {}, page2, BASE + '/collections/all?page=2')]
+        with self.assertRaises(LookupFailure):
+            discover(self.c)
+
     def test_incomplete_main_returns_nonzero(self):
         from capture import main
         with patch('sys.argv', ['capture.py', '--verify-only', '--scope', 'pilot']), patch('capture.Client', return_value=self.c):

@@ -196,9 +196,10 @@ def discover(client):
             time.sleep(5)  # Do not burst live storefront pagination requests.
         url = BASE + '/collections/all' + ('?page=' + str(page) if page > 1 else '')
         status, headers, body, final = client.request(url)
-        # Shopify may canonicalize pagination to /collections/all; discovery
-        # still checks the requested page response, not archive evidence.
-        if status != 200 or identity(final) != identity(url) or not usable_html(body, BASE + '/collections/all'):
+        # Validate the actual requested pagination identity. Shopify's live
+        # page-2 canonical includes ?page=2, so validating against the base
+        # collection would incorrectly reject a valid catalog page.
+        if status != 200 or identity(final) != identity(url) or not usable_html(body, url):
             raise LookupFailure('Catalog discovery failed on page %s (HTTP %s)' % (page, status))
         paths = set(re.findall(r'/products/[a-zA-Z0-9-]+', body))
         if not paths:
