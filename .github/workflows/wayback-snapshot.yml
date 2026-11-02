@@ -39,7 +39,7 @@ jobs:
         with:
           path: .capture-state
           key: ${{ inputs.recovery_cache_key || format('wayback-state-v1-{0}-{1}', github.run_id, github.run_attempt) }}
-          restore-keys: ${{ inputs.recovery_cache_key || 'wayback-state-v1-' }}
+          restore-keys: ${{ !inputs.recovery_cache_key && 'wayback-state-v1-' || '' }}
       - name: Capture and independently verify
         env:
           ARCHIVE_ORG_ACCESS_KEY: ${{ secrets.ARCHIVE_ORG_ACCESS_KEY }}
@@ -60,7 +60,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .capture-state
-          key: wayback-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ inputs.recovery_cache_key && 'wayback-recovery-v1' || 'wayback-state-v1' }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Publish per-URL evidence
         if: always()
         uses: actions/upload-artifact@v4
