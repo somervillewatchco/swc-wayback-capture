@@ -463,6 +463,113 @@ class RunnerTests(unittest.TestCase):
         with patch('sys.argv', ['capture.py', '--verify-only', '--scope', 'pilot']), patch('capture.Client', return_value=self.c):
             self.assertEqual(main(), 1)
 
+class SitemapTests(unittest.TestCase):
+    def setUp(self):
+        self.client = Mock()
+        self.sleep = patch('capture.time.sleep').start()
+        self.addCleanup(patch.stopall)
+        self.ns = 'http://www.sitemaps.org/schemas/sitemap/0.9'
+
+    def xml(self, urls, index=False):
+        root, child = ('sitemapindex', 'sitemap') if index else ('urlset', 'url')
+        return '<' + root + ' xmlns="' + self.ns + '">' + ''.join('<' + child + '><loc>' + u.replace('&', '&amp;') + '</loc></' + child + '>' for u in urls) + '</' + root + '>'
+
+    def response(self, body, url=None):
+        return (200, {}, body, url or BASE + '/sitemap.xml')
+
+    def test_nested_indexes_pages_products_collections_blogs_and_posts(self):
+        from capture import discover_sitemap
+        root = BASE + '/sitemap.xml'; nested = BASE + '/nested.xml'; pages = BASE + '/pages.xml'
+        urls = [BASE + '/pages/about', BASE + '/products/watch', BASE + '/collections/new',
+                BASE + '/blogs/news', BASE + '/blogs/news/post']
+        self.client.request.side_effect = [self.response(self.xml([nested], True), root),
+            self.response(self.xml([pages], True), nested), self.response(self.xml(urls), pages)]
+        self.assertEqual(discover_sitemap(self.client), sorted(urls))
+        self.assertEqual(self.client.request.call_count, 3)
+
+    def test_image_external_and_duplicate_locations_are_not_targets(self):
+        from capture import discover_sitemap
+        body = '<urlset xmlns="' + self.ns + '" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">'
+        body += '<url><loc>' + BASE + '/pages/about</loc><image:image><image:loc>https://cdn.shopify.com/a.png</image:loc></image:image></url>'
+        body += '<url><loc>' + BASE + '/pages/about/</loc></url><url><loc>https://other.example/x</loc></url></urlset>'
+        self.client.request.return_value = self.response(body)
+        self.assertEqual(len(discover_sitemap(self.client)), 1)
+
+    def test_external_index_not_fetched(self):
+        from capture import discover_sitemap
+        local = BASE + '/pages.xml'
+        self.client.request.side_effect = [self.response(self.xml(['https://other.example/map.xml', local], True)),
+                                          self.response(self.xml([BASE + '/pages/a']), local)]
+        self.assertEqual(discover_sitemap(self.client), [BASE + '/pages/a'])
+        self.assertEqual(self.client.request.call_count, 2)
+
+    def test_cycle_is_deduplicated(self):
+        from capture import discover_sitemap
+        pages = BASE + '/pages.xml'
+        self.client.request.side_effect = [self.response(self.xml([BASE + '/sitemap.xml', pages, pages], True)),
+                                          self.response(self.xml([BASE + '/pages/a']), pages)]
+        self.assertEqual(discover_sitemap(self.client), [BASE + '/pages/a'])
+        self.assertEqual(self.client.request.call_count, 2)
+
+    def test_bounded_depth_map_count_and_url_count(self):
+        from capture import discover_sitemap
+        for kwargs in ({'max_depth': 0}, {'max_sitemaps': 1}):
+            with self.subTest(kwargs=kwargs):
+                self.client.request.return_value = self.response(self.xml([BASE + '/next.xml'], True))
+                with self.assertRaises(LookupFailure): discover_sitemap(self.client, **kwargs)
+        self.client.request.return_value = self.response(self.xml([BASE + '/pages/a', BASE + '/pages/b']))
+        with self.assertRaises(LookupFailure): discover_sitemap(self.client, max_urls=1)
+
+    def test_malformed_dtd_unexpected_root_and_redirect_fail_closed(self):
+        from capture import discover_sitemap
+        for body in ('<broken', '<!DOCTYPE x><urlset/>', '<urlset xmlns="https://wrong.example"/>', '<html/>'):
+            with self.subTest(body=body):
+                self.client.request.return_value = self.response(body)
+                with self.assertRaises(LookupFailure): discover_sitemap(self.client)
+        self.client.request.return_value = self.response(self.xml([BASE + '/pages/a']), 'https://other.example/map.xml')
+        with self.assertRaises(LookupFailure): discover_sitemap(self.client)
+
+    def test_supplemental_excludes_entire_all_scope_not_just_successes(self):
+        from capture import discover_supplemental
+        with patch('capture.discover', return_value=[BASE + '/collections/all', BASE + '/products/watch']), patch('capture.discover_sitemap', return_value=[BASE + '/', BASE + '/pages/warranty-policy', BASE + '/products/watch', BASE + '/blogs/news/post']):
+            self.assertEqual(discover_supplemental(self.client), [BASE + '/blogs/news/post'])
+
+    def test_supplemental_discovery_failure_does_not_process_priority(self):
+        from capture import main
+        with tempfile.TemporaryDirectory() as tmp, patch('sys.argv', ['capture.py', '--scope', 'supplemental', '--state', tmp + '/state.json']), patch('capture.discover_supplemental', side_effect=LookupFailure('failed')), patch('capture.Runner.process') as process, patch('capture.Runner.result') as result, patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}):
+            self.assertEqual(main(), 1)
+            process.assert_not_called()
+            self.assertEqual(result.call_args.args[1], 'discovery-incomplete')
+
+    def test_known_markdown_target_reported_without_submission(self):
+        from capture import main
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.getcwd()
+            try:
+                os.chdir(tmp)
+                with patch('sys.argv', ['capture.py', '--scope', 'supplemental']), patch('capture.discover_supplemental', return_value=[BASE + '/agents.md', BASE + '/pages/about']), patch('capture.Runner.process') as process, patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}):
+                    self.assertEqual(main(), 1)
+                    process.assert_called_once_with(BASE + '/pages/about')
+                    report = json.loads(Path('capture-report.json').read_text())
+                    self.assertEqual(report[0]['url'], BASE + '/agents.md')
+                    self.assertEqual(report[0]['state'], 'unsupported-document-type')
+            finally:
+                os.chdir(old)
+
+    def test_empty_supplemental_inventory_is_not_fake_capture_success(self):
+        from capture import main
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.getcwd()
+            try:
+                os.chdir(tmp)
+                with patch('sys.argv', ['capture.py', '--scope', 'supplemental']), patch('capture.discover_supplemental', return_value=[]), patch('capture.Runner.process') as process, patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}):
+                    self.assertEqual(main(), 0)
+                    process.assert_not_called()
+                    self.assertEqual(json.loads(Path('capture-report.json').read_text())[0]['state'], 'no-additional-targets')
+            finally:
+                os.chdir(old)
+
+
 class WorkflowTests(unittest.TestCase):
     def test_recovery_cache_is_not_promoted_to_production(self):
         workflow = (Path(__file__).resolve().parent / '.github/workflows/wayback-snapshot.yml').read_text()

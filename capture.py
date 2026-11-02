@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.parse as up
 import urllib.request as ur
+import xml.etree.ElementTree as ET
 
 BASE = 'https://somervillewatchco.com'
 PRIORITY = ['/', '/policies/refund-policy', '/policies/shipping-policy',
@@ -215,6 +216,73 @@ def discover(client):
         if not any(n > page for n in linked):
             return urls + [BASE + p for p in sorted(seen)]
     raise LookupFailure('Catalog pagination exceeded limit')
+
+def discover_sitemap(client, max_sitemaps=32, max_depth=4, max_urls=5000):
+    """Read bounded, same-origin sitemap XML; image locs are never targets."""
+    namespace = 'http://www.sitemaps.org/schemas/sitemap/0.9'
+    origin = up.urlsplit(BASE)
+    visited, targets = set(), {}
+    queue = [(BASE + '/sitemap.xml', 0)]
+
+    def same_origin(value):
+        try:
+            parts = up.urlsplit(value)
+            return (parts.scheme, parts.netloc) == (origin.scheme, origin.netloc) and not parts.fragment
+        except ValueError:
+            return False
+
+    while queue:
+        url, depth = queue.pop(0)
+        if url in visited:
+            continue
+        if depth > max_depth or len(visited) >= max_sitemaps:
+            raise LookupFailure('Sitemap recursion/quantity limit exceeded')
+        if visited:
+            time.sleep(2)
+        visited.add(url)
+        code, _, body, final = client.request(url)
+        if code != 200 or not same_origin(final) or identity(final) != identity(url):
+            raise LookupFailure('Sitemap request failed or redirected outside expected URL')
+        # Reject DTD/entity processing entirely; a public sitemap needs neither.
+        if re.search(r'<!\s*(?:DOCTYPE|ENTITY)\b', body, re.I):
+            raise LookupFailure('Sitemap DTD/entities are not supported')
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError:
+            raise LookupFailure('Malformed sitemap XML') from None
+        prefix = '{' + namespace + '}' if root.tag.startswith('{' + namespace + '}') else ''
+        if root.tag not in (prefix + 'sitemapindex', prefix + 'urlset'):
+            raise LookupFailure('Unsupported sitemap root or namespace')
+        is_index = root.tag == prefix + 'sitemapindex'
+        child_tag = prefix + ('sitemap' if is_index else 'url')
+        for child in root.findall(child_tag):
+            # Direct standard-namespace loc only: excludes image:loc/video:loc.
+            loc = child.find(prefix + 'loc')
+            value = loc.text.strip() if loc is not None and loc.text else ''
+            if not value:
+                raise LookupFailure('Sitemap record has no loc')
+            if not same_origin(value):
+                continue  # External resources are not in the approved site scope.
+            if is_index:
+                if value not in visited:
+                    queue.append((value, depth + 1))
+            else:
+                key = identity(value)
+                if key:
+                    targets[key] = value
+                    if len(targets) > max_urls:
+                        raise LookupFailure('Sitemap URL limit exceeded')
+    if not targets:
+        raise LookupFailure('No published same-origin sitemap targets discovered')
+    return sorted(targets.values())
+
+
+def discover_supplemental(client):
+    # Fully finish both inventories before any capture can occur. Subtract the
+    # existing all-scope definition, not merely successful captures from it.
+    baseline = {identity(BASE + path) for path in PRIORITY}
+    baseline.update(identity(url) for url in discover(client))
+    return [url for url in discover_sitemap(client) if identity(url) not in baseline]
 
 class Runner:
     def __init__(self, client, state_path, budget=17400, interval=60, verify_only=False, poll_only=False):
@@ -455,14 +523,27 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--verify-only', action='store_true')
     mode.add_argument('--poll-only', action='store_true', help='Read existing job status and archive evidence; never submit')
-    parser.add_argument('--scope', choices=('all', 'priority', 'pilot'), default='all')
+    parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental'), default='all')
     parser.add_argument('--state', default='.capture-state/pending.json')
     parser.add_argument('--budget', type=int, default=17400)
     args = parser.parse_args()
     client = Client()
     runner = Runner(client, args.state, args.budget, verify_only=args.verify_only, poll_only=args.poll_only)
-    urls = [BASE + p for p in (['/pages/warranty-policy'] if args.scope == 'pilot' else PRIORITY)]
+    urls = [] if args.scope == 'supplemental' else [BASE + p for p in (['/pages/warranty-policy'] if args.scope == 'pilot' else PRIORITY)]
+    if args.scope == 'supplemental':
+        try:
+            urls = discover_supplemental(client)
+            if not urls:
+                runner.result(BASE + '/sitemap.xml', 'no-additional-targets', reason='published sitemap is fully covered by existing all-scope inventory')
+        except LookupFailure as exc:
+            runner.result(BASE + '/sitemap.xml', 'discovery-incomplete', reason=str(exc))
     for url in urls:
+        if args.scope == 'supplemental' and url == BASE + '/agents.md':
+            # Observed live as text/markdown. Keep it visible in the inventory
+            # without submitting a capture our HTML-only verifier cannot prove.
+            runner.result(url, 'unsupported-document-type', content_type='text/markdown',
+                          reason='published text document is outside the HTML verifier; no submission made')
+            continue
         # A dispatch gets one submission opportunity per URL. A host refusal
         # preserves cooldown but never triggers another POST in this run.
         runner.process(url)
@@ -477,7 +558,7 @@ def main():
     print(summary)
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         Path(os.environ['GITHUB_STEP_SUMMARY']).write_text(summary)
-    return 0 if runner.results and all(r['state'] == 'verified' for r in runner.results) else 1
+    return 0 if runner.results and all(r['state'] in ('verified', 'no-additional-targets') for r in runner.results) else 1
 
 if __name__ == '__main__':
     raise SystemExit(main())
