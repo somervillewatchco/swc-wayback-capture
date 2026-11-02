@@ -1,0 +1,33 @@
+name: Paced public Wayback transport diagnosis
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: wayback-snapshot
+  cancel-in-progress: false
+jobs:
+  paced-public-diagnosis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Offline paced diagnostic regression tests
+        run: |
+          test_dir=$(mktemp -d)
+          trap 'rm -rf "$test_dir"' EXIT
+          cd "$test_dir"
+          env -u GITHUB_STEP_SUMMARY PYTHONPATH="$GITHUB_WORKSPACE" python -m unittest -v test_diagnose_transport_paced
+      - name: Six bounded public Archive GETs with two-minute spacing
+        run: python diagnose_transport_paced.py
+      - name: Publish sanitized paced transport evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: transport-paced-${{ github.run_id }}-${{ github.run_attempt }}
+          path: transport-paced-report.json
+          if-no-files-found: warn
+          retention-days: 90
