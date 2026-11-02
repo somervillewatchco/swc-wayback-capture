@@ -8,7 +8,7 @@ on:
       scope:
         description: 'Capture scope (supplemental = sitemap pages outside all-scope inventory)'
         type: choice
-        options: [pilot, priority, all, supplemental, transport_probe]
+        options: [pilot, priority, all, supplemental, transport_probe, pacing_probe]
         default: pilot
       verify_only:
         description: 'Read archive evidence without submitting captures'
