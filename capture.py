@@ -28,6 +28,8 @@ def epoch(value):
     return dt.datetime.strptime(value, '%Y%m%d%H%M%S').replace(tzinfo=UTC).timestamp()
 
 def identity(url):
+    if not isinstance(url, str):
+        return None
     p = up.urlsplit(url)
     if p.scheme not in ('http', 'https') or p.hostname not in ('somervillewatchco.com', 'www.somervillewatchco.com'):
         return None
@@ -175,13 +177,14 @@ def discover(client):
     raise LookupFailure('Catalog pagination exceeded limit')
 
 class Runner:
-    def __init__(self, client, state_path, budget=17400, interval=60, verify_only=False):
+    def __init__(self, client, state_path, budget=17400, interval=60, verify_only=False, poll_only=False):
         self.client, self.state_path = client, Path(state_path)
         self.state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {}
         self.started = time.time()
         self.since = dt.datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         self.deadline, self.interval = self.started + budget, interval
         self.verify_only = verify_only
+        self.poll_only = poll_only
         self.next_submit = self.state.get('_next_submit', 0)
         self.results = []
 
@@ -193,6 +196,16 @@ class Runner:
 
     def result(self, url, state, **extra):
         row = {'url': url, 'state': state, **extra}
+        # Retain only allowlisted diagnostic fields, never raw authenticated
+        # responses/headers or arbitrary returned URL/query strings.
+        pending = self.state.get(url, {})
+        job_id = pending.get('job_id')
+        if isinstance(job_id, str) and re.fullmatch(r'[A-Za-z0-9_-]+', job_id):
+            row['job_id'] = job_id
+        if isinstance(pending.get('submitted_at'), (int, float)):
+            row['submitted_at'] = pending['submitted_at']
+        if pending.get('status_evidence'):
+            row['status_evidence'] = pending['status_evidence']
         self.results.append(row)
         print(json.dumps(row), flush=True)
         Path('capture-report.json').write_text(json.dumps(self.results, indent=2))
@@ -230,6 +243,8 @@ class Runner:
             if self.verify_only:
                 return self.result(url, 'unverified', reason='no usable indexed capture for UTC day')
             pending = self.state.get(url)
+            if not pending and self.poll_only:
+                return self.result(url, 'unverified', reason='no saved job to poll; no submission made')
             if not pending:
                 delay = max(0, self.next_submit - time.time())
                 if time.time() + delay + 120 >= self.deadline:
@@ -281,10 +296,28 @@ class Runner:
                         fresh = pending['submitted_at'] - 5 <= epoch(obj.get('timestamp', '')) <= time.time() + 60
                     except (ValueError, TypeError):
                         fresh = False
-                    if not fresh or identity(obj.get('original_url', '')) != identity(url):
-                        self.state.pop(url, None)
-                        self.save()
-                        return self.result(url, 'failed', reason='job success has stale/missing timestamp or different URL')
+                    original_matches = identity(obj.get('original_url')) == identity(url)
+                    returned_timestamp = obj.get('timestamp')
+                    pending['status_evidence'] = {
+                        'status': 'success', 'http_status': status,
+                        'checked_at': timestamp(time.time()),
+                        'timestamp_valid_format': isinstance(returned_timestamp, str)
+                            and bool(re.fullmatch(r'[0-9]{14}', returned_timestamp)),
+                        'timestamp_fresh': fresh,
+                        'original_url_present': bool(obj.get('original_url')),
+                        'original_url_matches': original_matches,
+                    }
+                    if pending['status_evidence']['timestamp_valid_format']:
+                        pending['status_evidence']['timestamp'] = returned_timestamp
+                    # Only echo the known requested URL, never an arbitrary
+                    # response URL that could contain credentials or tokens.
+                    if original_matches:
+                        pending['status_evidence']['original_url'] = url
+                    self.save()
+                    if not fresh or not original_matches:
+                        # A claimed success can still represent a real job.
+                        # Preserve its ID so a later run rechecks, never reposts.
+                        return self.result(url, 'pending', reason='job success has stale/missing timestamp or different URL; retained for review')
                     evidence = self.client.verify(url, max(self.since, pending['submitted_at'] - 5))
                     if evidence:
                         self.state.pop(url, None)
@@ -302,13 +335,15 @@ class Runner:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--verify-only', action='store_true')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--verify-only', action='store_true')
+    mode.add_argument('--poll-only', action='store_true', help='Read existing job status and archive evidence; never submit')
     parser.add_argument('--scope', choices=('all', 'priority', 'pilot'), default='all')
     parser.add_argument('--state', default='.capture-state/pending.json')
     parser.add_argument('--budget', type=int, default=17400)
     args = parser.parse_args()
     client = Client()
-    runner = Runner(client, args.state, args.budget, verify_only=args.verify_only)
+    runner = Runner(client, args.state, args.budget, verify_only=args.verify_only, poll_only=args.poll_only)
     urls = [BASE + p for p in (['/pages/warranty-policy'] if args.scope == 'pilot' else PRIORITY)]
     for url in urls:
         result = runner.process(url)

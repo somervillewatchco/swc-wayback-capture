@@ -86,6 +86,8 @@ class RunnerTests(unittest.TestCase):
         self.c = Mock(); self.c.verify.return_value = None
         self.r = Runner(self.c, 'state.json', budget=200, interval=60)
         self.sleep = patch('capture.time.sleep').start(); self.addCleanup(patch.stopall)
+        # main() is exercised offline; never write into a real CI step summary.
+        patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}).start()
 
     def test_pending_never_verified_and_saved(self):
         self.c.json.side_effect = [(200, {}, {'job_id': 'job'})] + [(200, {}, {'status': 'pending'})]*12
@@ -94,7 +96,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_old_success_rejected(self):
         self.c.json.side_effect = [(200, {}, {'job_id': 'job'}), (200, {}, {'status':'success','original_url':URL,'timestamp':'20200101000000'})]
-        self.assertEqual(self.r.process(URL)['state'], 'failed')
+        self.assertEqual(self.r.process(URL)['state'], 'pending')
 
     def test_job_success_without_index_is_pending(self):
         self.c.json.side_effect = [(200, {}, {'job_id':'job'})] + [(200, {}, {'status':'success','original_url':URL,'timestamp':timestamp(time.time())})]*12
@@ -168,7 +170,109 @@ class RunnerTests(unittest.TestCase):
     def test_missing_original_url_is_not_success(self):
         self.c.json.side_effect = [(200, {}, {'job_id':'job'}),
             (200, {}, {'status':'success','timestamp':timestamp(time.time())})]
-        self.assertEqual(self.r.process(URL)['state'], 'failed')
+        self.assertEqual(self.r.process(URL)['state'], 'pending')
+
+    def test_ambiguous_success_preserved_without_duplicate_post(self):
+        self.c.json.side_effect = [(200, {}, {'job_id': 'job'}),
+            (200, {}, {'status': 'success', 'timestamp': '20200101000000',
+                       'original_url': URL})]
+        result = self.r.process(URL)
+        self.assertEqual(result['state'], 'pending')
+        self.assertEqual(result['job_id'], 'job')
+        self.assertFalse(result['status_evidence']['timestamp_fresh'])
+        self.assertEqual(result['status_evidence']['timestamp'], '20200101000000')
+        saved = json.loads(Path('state.json').read_text())
+        self.assertEqual(saved[URL]['job_id'], 'job')
+        self.c.json.side_effect = None
+        self.c.json.return_value = (200, {}, {'status': 'success'})
+        self.c.json.reset_mock()
+        again = Runner(self.c, 'state.json')
+        self.assertEqual(again.process(URL)['state'], 'pending')
+        self.assertEqual(self.c.json.call_count, 1)
+        self.assertEqual(self.c.json.call_args.args[0], 'https://web.archive.org/save/status/job')
+        self.assertIn(URL, again.state)
+
+    def test_ambiguous_success_diagnostics_exclude_secrets(self):
+        self.c.json.side_effect = [(200, {}, {'job_id': 'job'}),
+            (200, {'Authorization': 'secret'}, {'status': 'success',
+             'timestamp': 'secret', 'original_url': 'https://evil.example/?token=secret',
+             'message': 'secret', 'access_key': 'secret'})]
+        result = self.r.process(URL)
+        self.assertEqual(result['state'], 'pending')
+        self.assertFalse(result['status_evidence']['original_url_matches'])
+        self.assertFalse(result['status_evidence']['timestamp_valid_format'])
+        self.assertNotIn('secret', Path('state.json').read_text())
+        self.assertNotIn('secret', Path('capture-report.json').read_text())
+
+    def test_malformed_original_url_remains_pending(self):
+        self.c.json.side_effect = [(200, {}, {'job_id': 'job'}),
+            (200, {}, {'status': 'success', 'timestamp': timestamp(time.time()),
+                       'original_url': {'unexpected': 'object'}})]
+        self.assertEqual(self.r.process(URL)['state'], 'pending')
+        self.assertIn(URL, self.r.state)
+
+    def test_read_only_recovery_preserves_ambiguous_job(self):
+        self.r.state[URL] = {'job_id': 'job', 'submitted_at': time.time(),
+                            'status_evidence': {'status': 'success'}}
+        self.r.save()
+        other = Runner(self.c, 'state.json', verify_only=True)
+        result = other.process(URL)
+        self.assertEqual(result['state'], 'unverified')
+        self.assertEqual(result['job_id'], 'job')
+        self.c.json.assert_not_called()
+        self.assertIn(URL, other.state)
+        self.c.verify.return_value = {'timestamp': timestamp(time.time())}
+        self.assertEqual(other.process(URL)['state'], 'verified')
+        self.c.json.assert_not_called()
+        self.assertNotIn(URL, other.state)
+
+    def test_poll_only_empty_state_never_submits(self):
+        other = Runner(self.c, 'state.json', poll_only=True)
+        self.assertEqual(other.process(URL)['state'], 'unverified')
+        self.c.json.assert_not_called()
+        self.assertNotIn(URL, other.state)
+
+    def test_poll_only_existing_job_reads_status_without_post(self):
+        self.r.state[URL] = {'job_id': 'saved-job', 'submitted_at': time.time()}
+        self.r.save()
+        self.c.json.return_value = (200, {}, {'status': 'success',
+            'original_url': URL, 'timestamp': timestamp(time.time())})
+        self.c.verify.side_effect = [None, {'timestamp': timestamp(time.time())}]
+        other = Runner(self.c, 'state.json', poll_only=True)
+        self.assertEqual(other.process(URL)['state'], 'verified')
+        self.c.json.assert_called_once_with('https://web.archive.org/save/status/saved-job', authenticated=True)
+        self.assertNotIn(URL, other.state)
+
+    def test_poll_only_ambiguous_status_keeps_job(self):
+        self.r.state[URL] = {'job_id': 'saved-job', 'submitted_at': time.time()}
+        self.r.save()
+        self.c.json.return_value = (200, {}, {'status': 'success',
+            'original_url': URL, 'timestamp': '20200101000000'})
+        other = Runner(self.c, 'state.json', poll_only=True)
+        result = other.process(URL)
+        self.assertEqual(result['state'], 'pending')
+        self.assertEqual(result['job_id'], 'saved-job')
+        self.assertFalse(result['status_evidence']['timestamp_fresh'])
+        self.c.json.assert_called_once_with('https://web.archive.org/save/status/saved-job', authenticated=True)
+        self.assertIn(URL, other.state)
+
+    def test_poll_only_unknown_job_outcome_never_submits(self):
+        self.r.state[URL] = {'job_id': None, 'submitted_at': time.time()}
+        self.r.save()
+        other = Runner(self.c, 'state.json', poll_only=True)
+        self.assertEqual(other.process(URL)['state'], 'pending')
+        self.c.json.assert_not_called()
+        self.assertIn(URL, other.state)
+
+    def test_main_test_does_not_pollute_ci_summary(self):
+        from capture import main
+        path = Path('ci-summary.md')
+        path.write_text('real summary')
+        # The suite's setUp deliberately clears the inherited variable.
+        self.assertEqual(os.environ.get('GITHUB_STEP_SUMMARY'), '')
+        with patch('sys.argv', ['capture.py', '--verify-only', '--scope', 'pilot']), patch('capture.Client', return_value=self.c):
+            main()
+        self.assertEqual(path.read_text(), 'real summary')
 
     def test_incomplete_main_returns_nonzero(self):
         from capture import main
