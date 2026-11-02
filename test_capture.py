@@ -964,6 +964,96 @@ class ResumableQueueTests(unittest.TestCase):
             self.c._request = Mock(return_value=response)
             self.assertFalse(self.r.recover_transport())
             self.assertEqual(self.c._request.call_count, 1)
+    def test_recovery_event_classifies_failure_without_raw_exception(self):
+        self.c._request = Mock(side_effect=LookupFailure('SECRET raw message', transport={
+            'phase': 'tcp_connect', 'reason_class': 'TimeoutError', 'errno': 110,
+            'raw': 'SECRET'}))
+        self.assertFalse(self.r.recover_transport(cycle=2))
+        event = self.r.state['_recovery_events'][-1]
+        self.assertEqual(event['cycle'], 2)
+        self.assertEqual(event['endpoint'], 'system_status')
+        self.assertEqual(event['transport_phase'], 'tcp_connect')
+        self.assertEqual(event['reason_class'], 'TimeoutError')
+        self.assertFalse(event['healthy'])
+        report = json.loads(Path('operational-report.json').read_text())
+        self.assertNotIn('SECRET', json.dumps(report))
+        self.assertEqual(self.r.results, [])
+        self.assertEqual(report['transport_cooldown_until'], self.r.state['_transport_cooldown_until'])
+    def test_health_events_preserve_http_cooldown_and_success_passes(self):
+        self.c._request = Mock(side_effect=lambda u: (429, {'Retry-After': '7200', 'Secret': 'SECRET'}, '{}', u))
+        self.assertFalse(self.r.recover_transport(cycle=1))
+        event = self.r.state['_recovery_events'][-1]
+        self.assertEqual(event['http_status'], 429)
+        self.assertGreaterEqual(event['cooldown_until'], self.now + 7200)
+        self.assertNotIn('SECRET', json.dumps(event))
+        self.r.deadline = self.now + 20000
+        self.c._request.side_effect = self.health
+        self.assertTrue(self.r.recover_transport(cycle=2))
+        events = self.r.state['_recovery_events']
+        self.assertEqual(events[-1]['phase'], 'resumed')
+        probes = [e for e in events if e.get('cycle') == 2 and e['phase'] == 'probe']
+        self.assertEqual(len(probes), 4)
+        self.assertEqual([e['pass_number'] for e in probes], [1, 1, 2, 2])
+    def test_operational_summary_queue_counts_separate_and_bounded(self):
+        self.r.deadline = self.now + 100
+        self.r.run_queue(self.urls, 'all')
+        self.r.state['_recovery_events'] = [{'phase': 'probe', 'healthy': False, 'message': 'SECRET'}] * 120
+        self.r.write_operational_report()
+        report = json.loads(Path('operational-report.json').read_text())
+        self.assertEqual(len(report['recovery_events']), 100)
+        self.assertNotIn('SECRET', json.dumps(report))
+        queue = report['queues'][0]
+        self.assertEqual(queue['cursor'], 0)
+        self.assertEqual(queue['remaining'], len(self.urls))
+        self.assertEqual(queue['processed_result_counts'], {})
+        self.assertNotIn('urls', queue)
+        self.assertEqual(len(self.r.results), len(self.urls))
+    def test_state_summary_redacts_invalid_metadata_values(self):
+        from capture import operational_summary
+        summary = operational_summary({'_next_submit': 'SECRET', '_transport_cooldown_until': 'SECRET',
+            '_recovery_events': [{'phase': 'SECRET', 'endpoint': 'SECRET', 'raw': 'SECRET', 'error_class': 'bad SECRET text'}],
+            URL: {'job_id': 'SECRET-job', 'review_required': True}})
+        self.assertNotIn('SECRET', json.dumps(summary))
+        self.assertEqual(summary['pending_counts']['total'], 1)
+        self.assertEqual(summary['pending_counts']['review_required'], 1)
+
+    def test_state_summary_malformed_shapes_do_not_leak_or_crash(self):
+        from capture import operational_summary
+        key = 'all:20261102:capture'
+        for state in [None, [], {'_queues': 'SECRET', '_recovery_events': {'raw': 'SECRET'}},
+                      {'_queues': {key: {'urls': 'SECRET', 'cursor': {'raw': 'SECRET'}, 'results': [None, 'SECRET', {'state': ['SECRET']}]}}},
+                      {'_queues': {key: 'SECRET', 123: None}, '_next_submit': {'raw': 'SECRET'}}]:
+            self.assertNotIn('SECRET', json.dumps(operational_summary(state)))
+
+    def test_inspect_state_output_collision_never_overwrites_input(self):
+        from capture import main
+        source = Path('saved-state.json')
+        source.write_text(json.dumps({'_next_submit': self.now}))
+        output = Path('operational-report.json')
+        output.symlink_to(source)
+        before = source.read_bytes()
+        for name in ('saved-state.json', 'operational-report.json'):
+            with patch('sys.argv', ['capture.py', '--inspect-state', '--state', name]), patch('capture.Client') as client:
+                self.assertEqual(main(), 0)
+                client.assert_not_called()
+            self.assertEqual(source.read_bytes(), before)
+        output.unlink()
+        os.link(source, output)
+        with patch('sys.argv', ['capture.py', '--inspect-state', '--state', str(source)]):
+            self.assertEqual(main(), 0)
+        self.assertEqual(source.read_bytes(), before)
+
+    def test_inspect_state_never_initializes_client_or_mutates_state(self):
+        from capture import main
+        self.r.state[URL] = {'job_id': 'SECRET-job', 'raw_message': 'SECRET'}
+        self.r.save()
+        before = Path('state.json').read_bytes()
+        with patch('sys.argv', ['capture.py', '--inspect-state', '--state', 'state.json']), patch('capture.Client') as client, patch('capture.Runner') as runner:
+            self.assertEqual(main(), 0)
+            client.assert_not_called(); runner.assert_not_called()
+        self.assertEqual(Path('state.json').read_bytes(), before)
+        self.assertNotIn('SECRET', Path('operational-report.json').read_text())
+
     def test_two_recovery_cycles_global_even_when_both_succeed(self):
         urls = self.urls * 1 + [BASE + '/pages/test-' + str(i) for i in range(7, 12)]
         calls = []
@@ -1015,6 +1105,14 @@ class ResumableQueueTests(unittest.TestCase):
         self.assertEqual(TRANSPORT_PROBE, BASE + '/products/date-mod-ice-blue-arabic-watch')
 
 class WorkflowTests(unittest.TestCase):
+    def test_operational_artifact_is_explicit_and_tests_are_isolated(self):
+        workflow = (Path(__file__).resolve().parent / '.github/workflows/wayback-snapshot.yml').read_text()
+        self.assertIn('test_dir=$(mktemp -d)', workflow)
+        self.assertIn('cd "$test_dir"', workflow)
+        self.assertIn('PYTHONPATH="$GITHUB_WORKSPACE"', workflow)
+        self.assertIn('path: |\n            capture-report.json\n            operational-report.json', workflow)
+        self.assertNotIn('path: .capture-state\n          if-no-files-found', workflow)
+
     def test_recovery_cache_is_not_promoted_to_production(self):
         workflow = (Path(__file__).resolve().parent / '.github/workflows/wayback-snapshot.yml').read_text()
         self.assertIn("key: ${{ inputs.recovery_cache_key && 'wayback-recovery-v1' || 'wayback-state-v1' }}", workflow)

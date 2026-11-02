@@ -77,6 +77,72 @@ def response_metadata(http_status, headers, obj):
             result['retry_after_until'] = deadline
     return result
 
+def safe_recovery_event(event):
+    result = {}
+    for key in ('cycle', 'pass_number', 'http_status', 'errno', 'cooldown_until', 'retry_after_until'):
+        value = event.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and abs(value) < 1e15:
+            result[key] = value
+    for key in ('healthy', 'final_url_matches', 'body_schema_matches'):
+        if isinstance(event.get(key), bool):
+            result[key] = event[key]
+    allowed = {'phase': ('waiting', 'budget_exhausted', 'probe', 'resumed'),
+               'endpoint': ('system_status', 'warranty_cdx'),
+               'transport_phase': ('tcp_connect', 'open', 'read', 'decode')}
+    for key, choices in allowed.items():
+        if event.get(key) in choices:
+            result[key] = event[key]
+    for key in ('error_class', 'reason_class'):
+        value = event.get(key)
+        if isinstance(value, str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', value):
+            result[key] = value
+    checked = event.get('checked_at')
+    if isinstance(checked, str) and re.fullmatch(r'[0-9]{14}', checked):
+        result['checked_at'] = checked
+    return result
+
+def operational_summary(state):
+    """Metadata only: no target URLs, job IDs, responses or environment values."""
+    state = state if isinstance(state, dict) else {}
+    queues = []
+    queue_map = state.get('_queues', {})
+    queue_map = queue_map if isinstance(queue_map, dict) else {}
+    for key, queue in queue_map.items():
+        if not isinstance(key, str) or not isinstance(queue, dict):
+            continue
+        if not re.fullmatch(r'(all|priority|pilot|supplemental|transport_probe):[0-9]{8}:(capture|poll|verify)', key):
+            continue
+        urls = queue.get('urls', [])
+        total = len(urls) if isinstance(urls, list) else 0
+        cursor = queue.get('cursor', 0)
+        cursor = cursor if isinstance(cursor, int) and not isinstance(cursor, bool) and 0 <= cursor < 1e15 else 0
+        counts = {}
+        rows = queue.get('results', [])
+        rows = rows if isinstance(rows, list) else []
+        for row in rows:
+            label = row.get('state') if isinstance(row, dict) else 'unknown'
+            if label not in ('verified', 'unverified', 'deferred', 'pending', 'failed', 'review_required', 'reused', 'unsupported-document-type', 'discovery-incomplete', 'no-additional-targets'):
+                label = 'unknown'
+            counts[label] = counts.get(label, 0) + 1
+        queues.append({'key': key, 'total': total, 'cursor': cursor,
+                       'remaining': max(0, total - cursor), 'complete': queue.get('complete') is True,
+                       'in_flight': queue.get('started') is not None, 'processed_result_counts': counts})
+    def safe_time(key):
+        value = state.get(key, 0)
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < 1e15 else 0
+    pending = [v for k, v in state.items() if isinstance(k, str) and k.startswith(BASE + '/') and isinstance(v, dict)]
+    events = state.get('_recovery_events', [])
+    events = events if isinstance(events, list) else []
+    return {'checked_at': timestamp(time.time()), 'queues': queues,
+            'pending_counts': {'total': len(pending),
+                               'with_job_id': sum(bool(p.get('job_id')) for p in pending),
+                               'review_required': sum(p.get('review_required') is True for p in pending),
+                               'known_not_sent': sum(p.get('known_not_sent') is True for p in pending)},
+            'transport_cooldown_until': safe_time('_transport_cooldown_until'),
+            'next_submit_at': safe_time('_next_submit'),
+            'recovery_events': [safe_recovery_event(e) for e in events[-100:] if isinstance(e, dict)],
+            'coverage_note': 'Queue progress and health probes are not capture coverage.'}
+
 class LookupFailure(Exception):
     def __init__(self, message, transport=None):
         super().__init__(message)
@@ -381,6 +447,21 @@ class Runner:
         tmp = self.state_path.with_suffix('.tmp')
         tmp.write_text(json.dumps(self.state, indent=2))
         tmp.replace(self.state_path)
+        self.write_operational_report()
+
+    def write_operational_report(self):
+        output = Path('operational-report.json')
+        if (output.resolve() != self.state_path.resolve()
+                and not (output.exists() and self.state_path.exists() and output.samefile(self.state_path))):
+            output.write_text(json.dumps(operational_summary(self.state), indent=2))
+
+    def recovery_event(self, phase, cycle, **details):
+        event = safe_recovery_event({'checked_at': timestamp(time.time()), 'cycle': cycle, 'phase': phase, **details})
+        events = self.state.setdefault('_recovery_events', [])
+        events.append(event)
+        self.state['_recovery_events'] = events[-100:]
+        self.save()
+        print(json.dumps({'recovery_event': event}), flush=True)
 
     def diagnostic_snapshot(self, url):
         # Only fields generated by our sanitizers; never raw SPN responses.
@@ -513,12 +594,14 @@ class Runner:
             Path('capture-report.json').write_text(json.dumps(self.results, indent=2))
         return row
 
-    def recover_transport(self):
+    def recover_transport(self, cycle=0):
         """Bounded public GET-only health gate, not proof of capture coverage."""
         until = max(self.state.get('_transport_cooldown_until', 0), self.next_submit)
-        # Four 35s HTTP timeouts plus the 30s interval and one URL operation.
+        # Estimated reserve; socket timeouts are not a hard wall-clock limit.
         if time.time() + max(0, until - time.time()) + 210 >= self.deadline:
+            self.recovery_event('budget_exhausted', cycle, healthy=False, cooldown_until=until)
             return False
+        self.recovery_event('waiting', cycle, cooldown_until=until)
         time.sleep(max(0, until - time.time()))
         query = up.urlencode({'url': BASE + '/pages/warranty-policy',
             'matchType': 'exact', 'from': timestamp(self.since), 'output': 'json',
@@ -530,25 +613,42 @@ class Runner:
                 time.sleep(30)
             for endpoint, expected in endpoints:
                 retry_until = 0
+                detail = {'pass_number': pass_number + 1,
+                          'endpoint': 'system_status' if expected is dict else 'warranty_cdx'}
                 try:
                     # Bypass retry orchestration, NOT proxy/TLS: one normal
                     # unauthenticated GET per endpoint/pass, no credentials.
                     code, headers, body, final = self.client._request(endpoint)
                     metadata = response_metadata(code, {k.lower(): v for k, v in headers.items()}, {})
                     retry_until = metadata.get('retry_after_until', 0)
-                    healthy = code == 200 and final == endpoint and isinstance(json.loads(body), expected)
-                except (LookupFailure, ValueError, TypeError):
+                    detail['http_status'] = code
+                    detail['final_url_matches'] = final == endpoint
+                    if retry_until:
+                        detail['retry_after_until'] = retry_until
+                    detail['body_schema_matches'] = isinstance(json.loads(body), expected)
+                    healthy = code == 200 and final == endpoint and detail['body_schema_matches']
+                except (LookupFailure, ValueError, TypeError) as exc:
                     healthy = False
+                    detail['error_class'] = type(exc).__name__
+                    transport = getattr(exc, 'transport', None) or {}
+                    if transport.get('phase') in ('tcp_connect', 'open', 'read', 'decode'):
+                        detail['transport_phase'] = transport['phase']
+                    reason = transport.get('reason_class')
+                    if isinstance(reason, str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', reason):
+                        detail['reason_class'] = reason
+                    if isinstance(transport.get('errno'), int):
+                        detail['errno'] = transport['errno']
                 if not healthy:
                     until = max(time.time() + 900, retry_until, self.next_submit)
                     self.state['_transport_cooldown_until'] = until
                     self.state['_next_submit'] = self.next_submit = until
-                    self.save()
+                    self.recovery_event('probe', cycle, healthy=False, cooldown_until=until, **detail)
                     return False
+                self.recovery_event('probe', cycle, healthy=True, **detail)
         self.transport_circuit_open = False
         self.transport_failure_streak = 0
         self.state.pop('_transport_cooldown_until', None)
-        self.save()
+        self.recovery_event('resumed', cycle, healthy=True, cooldown_until=0)
         return True
 
     def run_queue(self, urls, scope):
@@ -583,7 +683,7 @@ class Runner:
                 if cycles >= 2:
                     break
                 cycles += 1
-                if not self.recover_transport():
+                if not self.recover_transport(cycle=cycles):
                     if time.time() + 1110 >= self.deadline:
                         break
                     continue
@@ -791,8 +891,19 @@ def main():
     mode.add_argument('--poll-only', action='store_true', help='Read existing job status and archive evidence; never submit')
     parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental', 'transport_probe'), default='all')
     parser.add_argument('--state', default='.capture-state/pending.json')
+    mode.add_argument('--inspect-state', action='store_true', help='Emit sanitized saved-state summary only; no network or state mutation')
     parser.add_argument('--budget', type=int, default=17400)
     args = parser.parse_args()
+    if args.inspect_state:
+        path = Path(args.state)
+        state = json.loads(path.read_text()) if path.exists() else {}
+        summary = operational_summary(state)
+        output = Path('operational-report.json')
+        if (output.resolve() != path.resolve()
+                and not (output.exists() and path.exists() and output.samefile(path))):
+            output.write_text(json.dumps(summary, indent=2))
+        print(json.dumps(summary), flush=True)
+        return 0
     client = Client()
     runner = Runner(client, args.state, args.budget, verify_only=args.verify_only, poll_only=args.poll_only)
     urls = [] if args.scope == 'supplemental' else [BASE + p for p in (['/pages/warranty-policy'] if args.scope == 'pilot' else PRIORITY)]

@@ -106,3 +106,21 @@ proven-not-sent releases, and reviewed prior-day reuse releases. A bounded
 an accepted job ID retains that job instead. Arbitrary raw messages, response URLs,
 headers and secrets are never stored. This improves future evidence; it cannot
 recover a response or job ID discarded by an older deployed version.
+
+### Recovery observability and offline state inspection
+
+`operational-report.json` accompanies (does not replace) the per-URL capture
+report in the existing evidence artifact. It records bounded, sanitized recovery
+history: cycle/pass, fixed endpoint label, HTTP status or exception class and
+transport phase, health decision, checked time and cooldown. It contains no raw
+body/message/header, credentials, job IDs or target URLs. Queue summaries expose
+scope/day/mode, cursor, total, remaining, in-flight flag and processed outcome
+counts; these are not coverage assertions and do not inflate capture counts.
+At most 100 recovery events are cached and exported; earlier runs without this
+instrumentation cannot retrospectively supply missing probe reasons.
+
+`python capture.py --inspect-state --state path/to/pending.json` emits that
+summary without instantiating a network client, submitting/polling, modifying
+saved state or reading credentials. It writes only `operational-report.json`.
+Offline workflow tests run in a temporary working directory so test-generated
+reports cannot be mistaken for real-run evidence.
