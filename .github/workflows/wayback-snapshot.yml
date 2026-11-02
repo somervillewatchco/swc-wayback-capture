@@ -14,6 +14,10 @@ on:
         description: 'Read archive evidence without submitting captures'
         type: boolean
         default: true
+      recovery_cache_key:
+        description: 'Optional exact prior state cache to recover; forces no-submission polling'
+        type: string
+        default: ''
 permissions:
   contents: read
 concurrency:
@@ -29,22 +33,27 @@ jobs:
         with:
           python-version: '3.12'
       - name: Offline regression tests
-        run: python -m unittest -v test_capture
+        run: env -u GITHUB_STEP_SUMMARY python -m unittest -v test_capture
       - name: Restore unresolved jobs and host cooldown
         uses: actions/cache/restore@v4
         with:
           path: .capture-state
-          key: wayback-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: wayback-state-v1-
+          key: ${{ inputs.recovery_cache_key || format('wayback-state-v1-{0}-{1}', github.run_id, github.run_attempt) }}
+          restore-keys: ${{ inputs.recovery_cache_key || 'wayback-state-v1-' }}
       - name: Capture and independently verify
         env:
           ARCHIVE_ORG_ACCESS_KEY: ${{ secrets.ARCHIVE_ORG_ACCESS_KEY }}
           ARCHIVE_ORG_SECRET_KEY: ${{ secrets.ARCHIVE_ORG_SECRET_KEY }}
+          RECOVERY_CACHE_KEY: ${{ inputs.recovery_cache_key }}
           SCOPE: ${{ inputs.scope || 'all' }}
           VERIFY_ONLY: ${{ inputs.verify_only && 'true' || 'false' }}
         run: |
           args=(--scope "$SCOPE")
-          if [[ "$VERIFY_ONLY" == true ]]; then args+=(--verify-only); fi
+          if [[ -n "$RECOVERY_CACHE_KEY" ]]; then
+            args+=(--poll-only)
+          elif [[ "$VERIFY_ONLY" == true ]]; then
+            args+=(--verify-only)
+          fi
           python capture.py "${args[@]}"
       - name: Preserve unresolved jobs even when verification fails
         if: always()
