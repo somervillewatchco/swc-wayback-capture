@@ -16,7 +16,7 @@ Recover a saved job without submitting: `python capture.py --poll-only --scope p
 
 Manual Actions runs default to read-only and the one-page warranty pilot. Set verify_only=false only after any other manual capture queue is finished. Choose priority or all for broader runs. Existing repository secrets are consumed only inside Actions; do not copy keys locally.
 
-Submissions are at least 60 seconds apart. Each dispatch has at most one submission opportunity per URL; a pilot never automatically submits a second capture after a host refusal. Host-paused/429 responses cause a persisted host-wide cooldown of at least 11 minutes (or longer Retry-After). A POST with an uncertain outcome is preserved and not automatically duplicated. Pending job IDs are cached across runs and rechecked. Success responses are resolved with independent archive evidence: proven prior-day reuse becomes terminal `reused` under the next-day policy below; missing/malformed timestamps, mismatched URLs and otherwise unknown outcomes remain `review_required`. Job ID, submission time, safe request/response diagnostics and parsed Retry-After are retained; none triggers an automatic duplicate submission in the same run. A throttled status lookup retains the accepted job and its cooldown rather than treating it as a refused submission. Arbitrary response bodies, headers, and unknown returned URLs are not retained. Cache loss/eviction is possible; review unresolved records before manually restarting. Failed status/index checks remain visible rather than being described as successful.
+Submissions are at least 60 seconds apart. Each dispatch has at most one logical submission per URL; a pilot never resubmits after an HTTP/host refusal. The narrowly proven TCP-not-sent case below permits one physical connection retry, not a second potentially accepted capture. Host-paused/429 responses cause a persisted host-wide cooldown of at least 11 minutes (or longer Retry-After). A POST with an uncertain outcome is preserved and not automatically duplicated. Pending job IDs are cached across runs and rechecked. Success responses are resolved with independent archive evidence: proven prior-day reuse becomes terminal `reused` under the next-day policy below; missing/malformed timestamps, mismatched URLs and otherwise unknown outcomes remain `review_required`. Job ID, submission time, safe request/response diagnostics and parsed Retry-After are retained; none triggers an automatic duplicate submission in the same run. A throttled status lookup retains the accepted job and its cooldown rather than treating it as a refused submission. Arbitrary response bodies, headers, and unknown returned URLs are not retained. Cache loss/eviction is possible; review unresolved records before manually restarting. Failed status/index checks remain visible rather than being described as successful.
 
 An accepted job can take longer than this run's polling window. Pending indexing is rechecked on the next run without a new POST. If an uncertain submission has no job ID and never appears in CDX, it requires review of the saved state before retrying; do not automatically clear it. CDX errors mean unknown, not absence. Historic index gaps cannot be repaired by captures made today.
 
@@ -53,3 +53,37 @@ Use the manual Actions `diagnostic=true` input (default false), or run `python d
 The script makes two paced passes, 30 seconds apart, over four fixed public GET endpoints: Archive system status, current-UTC-day warranty CDX, the known terms replay `20261102015923`, and the storefront refund page. HTTP timeout is 10 seconds; DNS observation timeout is 5 seconds; requests are 3 seconds apart, redirects are not followed, and at most 4 KiB is read without logging response content. A host's HTTP 429 suppresses remaining probes until its parsed Retry-After (at least 60 seconds). The workflow bounds the diagnostic step to five minutes.
 
 Evidence contains HTTP status, allowlisted content type, elapsed time, open/read phase, exception and nested reason class/errno, and traceback **function names only**—not raw exception messages, headers, body, filesystem paths, environment values or secrets. It records Python/OpenSSL versions, proxy-variable **presence only**, and DNS address-family/count (no address values). Normal urllib proxy/TLS behavior stays intact; no IP pinning, direct TCP workaround, proxy bypass or TLS weakening is used. DNS observations describe the local resolver and do not prove how a configured proxy resolves the destination. Compare the same script's cloud and GitHub artifacts to distinguish local/proxy resolution, connection establishment, HTTP refusal and body-read failures. A completed diagnostic run is not evidence of capture success.
+
+## Bounded transport resilience and circuit breaker
+
+A POST may receive **one** retry only when instrumented `HTTPSConnection._create_connection` raises before it returns any connected TCP socket. That proves this new attempt could not have transmitted target HTTP bytes. The delay is at least 60 seconds, respects a longer stored submission cooldown, and requires enough remaining run budget. HTTP responses (including redirects/429), established-TCP proxy CONNECT/TLS failures, send/partial-send failures, read timeouts and all unclassified errors are **not** eligible for POST retry. The second attempt gets a fresh tracker; uncertainty on it overrides the first attempt's safe failure. Attempt numbers/timestamps are persisted before each physical attempt; diagnostics never include credentials or exception messages. Existing TLS/proxy behavior remains unchanged and authenticated requests are restricted to the HTTPS SPN endpoints without redirects.
+
+Only newly created attempts with this direct proof may receive `known_not_sent` state and retry at a later scheduled opportunity after cooldown. Historical no-job records—including the 11 uncertain records from the interrupted full run—are never inferred safe or automatically cleared. Ordinary daily archive evidence can still resolve them.
+
+After three consecutive **URL operations** containing an exhausted Archive transport failure, the run opens a circuit breaker and checkpoints the untouched queue for bounded pause/health-check/resume (below). Only after recovery/budget exhaustion are remaining URLs reported deferred without further requests. Internal GET retry attempts and the one safe POST retry do not multiply the count. An intermediate healthy CDX response does not erase a later POST/status failure for that URL. The streak resets only after a completed URL operation has a healthy Archive HTTP response and no exhausted transport failure; storefront responses cannot reset it. A 15-minute local-policy cooldown is persisted (not represented as an Archive.org-imposed window), preserving any longer submission cooldown. Subsequent capture runs respect it; the separate public diagnostic mode can establish transport health without touching capture state. This limits load and failure propagation; it does not claim to repair Archive.org connectivity.
+
+### Resuming a transport outage
+
+Three consecutive URL operations with exhausted Archive transport failures pause
+submissions rather than abandon the queue. Progress (inventory, cursor and actual
+per-URL outcomes) is atomically checkpointed by scope, initial UTC day and mode.
+The run waits a local-policy 15 minutes, then requires two healthy public GET
+passes (SPN system status and exact warranty CDX, 30 seconds apart) before
+resuming **untouched URLs only**, with normal submission spacing. These probes
+show connectivity, not successful captures. Failed probes extend the local pause
+and honor longer Retry-After values; at most two recovery cycles run within the
+remaining time budget. No proxy bypass, TLS changes or authenticated health calls.
+
+When recovery/budget is exhausted, untouched suffix entries are reported deferred,
+not consumed or marked verified. A later same-day run resumes that suffix; a
+completed checkpoint is rebuilt on a later invocation, and next-day queues start
+afresh for the daily goal. An interrupted in-flight operation is reported
+unverified and skipped on resume, preserving its pending state. Existing unknown
+submissions (including the 11 historical jobs) remain protected from blind POSTs.
+Queue completion does **not** imply coverage: prior unverified/unsupported results
+remain in the report and keep the exit status incomplete. Modes/scopes have separate
+checkpoints, so a probe/recovery run cannot overwrite an all-scope cursor.
+
+`--scope transport_probe` selects only the fixed, previously untouched product
+`https://somervillewatchco.com/products/date-mod-ice-blue-arabic-watch` for a scoped
+live transport test. It does not change the warranty pilot or scheduled scopes.

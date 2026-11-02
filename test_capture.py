@@ -458,10 +458,230 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(LookupFailure):
             discover(self.c)
 
+    def test_new_known_not_sent_marker_can_retry_but_legacy_unknown_cannot(self):
+        failure = LookupFailure('Network failure', transport={'known_not_sent': True, 'phase': 'tcp_connect'})
+        self.c.json.side_effect = failure
+        self.assertEqual(self.r.process(URL)['state'], 'unverified')
+        self.assertTrue(self.r.state[URL]['known_not_sent'])
+        self.c.json.side_effect = [(200, {}, {'job_id': 'new-job'})] + [(200, {}, {'status': 'pending'})] * 12
+        self.assertEqual(self.r.process(URL)['state'], 'pending')
+        self.assertEqual(self.r.state[URL]['job_id'], 'new-job')
+        legacy_url = BASE + '/pages/legacy'
+        self.r.state[legacy_url] = {'job_id': None, 'submitted_at': time.time() - 3600}
+        self.c.json.reset_mock()
+        self.assertEqual(self.r.process(legacy_url)['state'], 'pending')
+        self.c.json.assert_not_called()
+        self.assertNotIn('known_not_sent', self.r.state[legacy_url])
+
+    def test_three_get_transport_failed_urls_open_breaker_and_skip_reads(self):
+        self.c.verify.side_effect = LookupFailure('Network failure', transport={'known_not_sent': True, 'phase': 'tcp_connect'})
+        for path in ('/one', '/two', '/three'):
+            self.assertEqual(self.r.process(BASE + path)['state'], 'unverified')
+        self.assertTrue(self.r.transport_circuit_open)
+        self.assertGreater(self.r.state['_transport_cooldown_until'], time.time() + 899)
+        self.c.verify.reset_mock()
+        self.assertEqual(self.r.process(BASE + '/four')['state'], 'deferred')
+        self.c.verify.assert_not_called(); self.c.json.assert_not_called()
+        self.assertTrue(all(r['state'] != 'verified' for r in self.r.results))
+
+    def test_intermediate_healthy_cdx_does_not_mask_three_post_failures(self):
+        self.c.archive_transport_failures = 0
+        self.c.archive_healthy_responses = 0
+        def healthy_cdx(*args):
+            self.c.archive_healthy_responses += 1
+            return None
+        self.c.verify.side_effect = healthy_cdx
+        self.c.json.side_effect = LookupFailure('Network failure', transport={'known_not_sent': False, 'phase': 'read'})
+        for path in ('/one', '/two', '/three'):
+            self.assertEqual(self.r.process(BASE + path)['state'], 'unverified')
+        self.assertTrue(self.r.transport_circuit_open)
+        for path in ('/one', '/two', '/three'):
+            self.assertIn(BASE + path, self.r.state)
+            self.assertNotIn('known_not_sent', self.r.state[BASE + path])
+
+    def test_completed_healthy_archive_operation_resets_streak(self):
+        self.c.archive_transport_failures = 0
+        self.c.archive_healthy_responses = 0
+        self.c.verify.side_effect = LookupFailure('Network failure', transport={'known_not_sent': False})
+        self.r.process(BASE + '/one'); self.r.process(BASE + '/two')
+        self.assertEqual(self.r.transport_failure_streak, 2)
+        def healthy(*args):
+            self.c.archive_healthy_responses += 1
+            return {'timestamp': timestamp(time.time())}
+        self.c.verify.side_effect = healthy
+        self.assertEqual(self.r.process(BASE + '/healthy')['state'], 'verified')
+        self.assertEqual(self.r.transport_failure_streak, 0)
+
+    def test_persisted_transport_cooldown_defers_without_mutating_legacy_pending(self):
+        self.r.state['_transport_cooldown_until'] = time.time() + 900
+        self.r.state[URL] = {'job_id': None, 'submitted_at': time.time() - 3600}
+        self.r.save()
+        other = Runner(self.c, 'state.json')
+        self.assertEqual(other.process(URL)['state'], 'deferred')
+        self.c.verify.assert_not_called(); self.c.json.assert_not_called()
+        self.assertEqual(other.state[URL]['job_id'], None)
+        self.assertNotIn('known_not_sent', other.state[URL])
+
+    def test_safe_retry_audit_paces_next_url_from_latest_attempt(self):
+        late = time.time() + 60
+        def submit_or_status(endpoint, *args, **kwargs):
+            if endpoint.endswith('/save/'):
+                self.c.post_attempt_callback({'attempt': 1, 'started_at': late - 60})
+                self.c.post_attempt_callback({'attempt': 2, 'started_at': late})
+                return (200, {}, {'job_id': 'job'})
+            return (200, {}, {'status': 'pending'})
+        self.c.json.side_effect = submit_or_status
+        self.assertEqual(self.r.process(URL)['state'], 'pending')
+        self.assertGreaterEqual(self.r.state['_next_submit'], late + self.r.interval)
+        self.assertEqual([a['attempt'] for a in self.r.state[URL]['request_evidence']['attempts']], [1, 2])
+
     def test_incomplete_main_returns_nonzero(self):
         from capture import main
         with patch('sys.argv', ['capture.py', '--verify-only', '--scope', 'pilot']), patch('capture.Client', return_value=self.c):
             self.assertEqual(main(), 1)
+
+class TransportResilienceTests(unittest.TestCase):
+    def failure(self, known=True, phase='tcp_connect'):
+        return LookupFailure('Network operation failed: ConnectionRefusedError', transport={
+            'known_not_sent': known, 'phase': phase, 'reason_class': 'ConnectionRefusedError', 'errno': 111})
+
+    @patch('capture.time.sleep')
+    def test_known_tcp_not_sent_has_at_most_one_retry(self, sleep):
+        c = Client(); c.post_retry_deadline = time.time() + 300
+        c._request = Mock(side_effect=[self.failure(), self.failure()])
+        with self.assertRaises(LookupFailure): c.request('https://web.archive.org/save/', {'url': URL})
+        self.assertEqual(c._request.call_count, 2)
+        sleep.assert_called_once_with(60)
+        self.assertEqual(c.archive_transport_failures, 1)
+
+    @patch('capture.time.sleep')
+    def test_first_safe_second_uncertain_overrides_proof(self, sleep):
+        c = Client(); c.post_retry_deadline = time.time() + 300
+        c._request = Mock(side_effect=[self.failure(), self.failure(False, 'read')])
+        with self.assertRaises(LookupFailure) as raised: c.request('https://web.archive.org/save/', {'url': URL})
+        self.assertFalse(raised.exception.transport['known_not_sent'])
+        self.assertEqual(raised.exception.transport['phase'], 'read')
+        self.assertEqual(c._request.call_count, 2)
+
+    @patch('capture.time.sleep')
+    def test_after_send_or_unknown_post_never_retried(self, sleep):
+        for error in (self.failure(False, 'read'), LookupFailure('unknown failure')):
+            c = Client(); c.post_retry_deadline = time.time() + 300
+            c._request = Mock(side_effect=error)
+            with self.assertRaises(LookupFailure): c.request('https://web.archive.org/save/', {'url': URL})
+            self.assertEqual(c._request.call_count, 1)
+        sleep.assert_not_called()
+
+    @patch('capture.time.sleep')
+    def test_post_http_status_never_transport_retried(self, sleep):
+        for status in (301, 307, 429, 503):
+            c = Client(); c.post_retry_deadline = time.time() + 300
+            c._request = Mock(return_value=(status, {}, '', 'https://web.archive.org/save/'))
+            self.assertEqual(c.request('https://web.archive.org/save/', {'url': URL})[0], status)
+            self.assertEqual(c._request.call_count, 1)
+        sleep.assert_not_called()
+
+    @patch('capture.time.sleep')
+    def test_post_retry_budget_and_longer_cooldown(self, sleep):
+        c = Client(); c.post_retry_deadline = time.time() + 60
+        c._request = Mock(side_effect=self.failure())
+        with self.assertRaises(LookupFailure): c.request('https://web.archive.org/save/', {'url': URL})
+        self.assertEqual(c._request.call_count, 1); sleep.assert_not_called()
+        c.post_retry_deadline = time.time() + 1000
+        c.post_retry_not_before = time.time() + 900
+        c._request = Mock(side_effect=[self.failure(), (200, {}, '{}', 'https://web.archive.org/save/')])
+        c.request('https://web.archive.org/save/', {'url': URL})
+        self.assertGreater(sleep.call_args.args[0], 899)
+        self.assertEqual(c._request.call_count, 2)
+
+    def test_physical_tcp_proof_is_narrow_and_per_connection(self):
+        from capture import TrackedHTTPSConnection
+        tracker = {'tcp_established': False}
+        with patch('socket.create_connection', side_effect=ConnectionRefusedError(111, 'SECRET')):
+            connection = TrackedHTTPSConnection('web.archive.org', transport_tracker=tracker)
+            with self.assertRaises(ConnectionRefusedError): connection._create_connection(('web.archive.org', 443))
+        self.assertTrue(tracker['tcp_connect_failed'])
+        self.assertFalse(tracker['tcp_established'])
+        next_tracker = {'tcp_established': False}
+        with patch('socket.create_connection', return_value=object()):
+            connection = TrackedHTTPSConnection('web.archive.org', transport_tracker=next_tracker)
+            connection._create_connection(('web.archive.org', 443))
+        self.assertTrue(next_tracker['tcp_established'])
+        self.assertNotIn('tcp_connect_failed', next_tracker)
+
+    def test_proxy_connect_tls_and_send_failures_remain_uncertain(self):
+        import urllib.error
+        for phase_message in ('proxy CONNECT failed SECRET', 'TLS failed SECRET', 'partial send SECRET'):
+            def opener(*handlers):
+                tracked = next(h for h in handlers if hasattr(h, 'tracker'))
+                tracked.tracker['tcp_established'] = True
+                result = Mock(); result.open.side_effect = urllib.error.URLError(OSError(phase_message))
+                return result
+            with patch('capture.ur.build_opener', side_effect=opener):
+                with self.assertRaises(LookupFailure) as raised:
+                    Client()._request('https://web.archive.org/save/', {'url': URL})
+            self.assertFalse(raised.exception.transport['known_not_sent'])
+            self.assertNotIn('SECRET', str(raised.exception))
+
+    def test_tcp_connection_refusal_proof_from_real_handler(self):
+        with patch('socket.create_connection', side_effect=ConnectionRefusedError(111, 'SECRET')):
+            with self.assertRaises(LookupFailure) as raised:
+                Client()._request('https://web.archive.org/save/', {'url': URL})
+        self.assertTrue(raised.exception.transport['known_not_sent'])
+        self.assertEqual(raised.exception.transport['phase'], 'tcp_connect')
+        self.assertEqual(raised.exception.transport['errno'], 111)
+        self.assertNotIn('SECRET', str(raised.exception))
+
+    @patch('capture.time.sleep')
+    def test_each_post_attempt_is_audited_before_network_io(self, sleep):
+        c = Client(); c.post_retry_deadline = time.time() + 300
+        audit = []
+        c.post_attempt_callback = lambda entry: audit.append(entry.copy())
+        def perform(*args):
+            if len(audit) == 1:
+                raise self.failure()
+            self.assertEqual(len(audit), 2)
+            return (200, {}, '{}', 'https://web.archive.org/save/')
+        c._request = Mock(side_effect=perform)
+        c.request('https://web.archive.org/save/', {'url': URL})
+        self.assertEqual([entry['attempt'] for entry in audit], [1, 2])
+        self.assertTrue(all(isinstance(entry['started_at'], float) for entry in audit))
+
+    @patch('capture.time.sleep')
+    def test_actual_response_read_failure_never_retries_post(self, sleep):
+        import http.client
+        for failure in (TimeoutError('SECRET'), http.client.IncompleteRead(b'SECRET')):
+            class BrokenResponse:
+                status = 200
+                headers = {}
+                url = 'https://web.archive.org/save/'
+                def __enter__(self): return self
+                def __exit__(self, *args): return False
+                def read(self, limit): raise failure
+            opener = Mock(); opener.open.return_value = BrokenResponse()
+            client = Client(); client.post_retry_deadline = time.time() + 300
+            with patch('capture.ur.build_opener', return_value=opener):
+                with self.assertRaises(LookupFailure) as raised:
+                    client.request('https://web.archive.org/save/', {'url': URL})
+            self.assertEqual(raised.exception.transport['phase'], 'read')
+            self.assertFalse(raised.exception.transport['known_not_sent'])
+            self.assertNotIn('SECRET', str(raised.exception))
+            self.assertEqual(opener.open.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_audit_callback_failure_prevents_network_attempt(self):
+        client = Client(); client.post_retry_deadline = time.time() + 300
+        client.post_attempt_callback = Mock(side_effect=OSError('audit unavailable'))
+        client._request = Mock()
+        with self.assertRaises(OSError): client.request('https://web.archive.org/save/', {'url': URL})
+        client._request.assert_not_called()
+
+    def test_authenticated_scope_rejects_non_spn_before_reading_keys(self):
+        for target in ('https://evil.example/save/', 'https://web.archive.org/cdx/search/cdx',
+                       'http://web.archive.org/save/', 'https://web.archive.org/save/?token=x'):
+            with patch('capture.os.environ.get', side_effect=AssertionError('must not read credentials')):
+                with self.assertRaises(LookupFailure): Client()._request(target, {'url': URL}, True)
+
 
 class SitemapTests(unittest.TestCase):
     def setUp(self):
@@ -569,6 +789,145 @@ class SitemapTests(unittest.TestCase):
             finally:
                 os.chdir(old)
 
+
+class ResumableQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.getcwd(); os.chdir(self.tmp.name)
+        self.now = 1793589000.0
+        self.clock = patch('capture.time.time', side_effect=lambda: self.now); self.clock.start()
+        self.sleep = patch('capture.time.sleep', side_effect=self.advance); self.sleep.start()
+        self.c = Client(); self.r = Runner(self.c, 'state.json', budget=10000)
+        self.urls = [BASE + '/pages/test-' + str(i) for i in range(7)]
+    def tearDown(self):
+        self.sleep.stop(); self.clock.stop(); os.chdir(self.old); self.tmp.cleanup()
+    def advance(self, seconds): self.now += seconds
+    def operation(self, url): return self.r.result(url, 'verified')
+    def health(self, url):
+        return (200, {}, '{}' if '/save/status/' in url else '[]', url)
+    def test_pause_recovers_only_untouched_suffix(self):
+        calls = []
+        def process(url):
+            calls.append(url)
+            if len(calls) == 3:
+                self.r.transport_circuit_open = True
+                self.r.state['_transport_cooldown_until'] = self.now + 900
+            return self.r.result(url, 'unverified' if len(calls) <= 3 else 'verified')
+        self.r.process = Mock(side_effect=process)
+        self.c._request = Mock(side_effect=self.health)
+        self.r.run_queue(self.urls, 'all')
+        self.assertEqual(calls, self.urls)
+        self.assertEqual(self.c._request.call_count, 4)
+        self.assertGreaterEqual(self.now, 1793589000 + 930)
+        self.assertTrue(next(iter(self.r.state['_queues'].values()))['complete'])
+        self.assertEqual(sum(r['state'] == 'unverified' for r in self.r.results), 3)
+        self.assertTrue(all(len(c.args) == 1 and not c.kwargs for c in self.c._request.call_args_list))
+    def test_failed_probes_bounded_and_checkpoint_resumes_suffix(self):
+        self.r.state['_transport_cooldown_until'] = self.now + 900
+        self.c._request = Mock(side_effect=LookupFailure('offline'))
+        self.r.process = Mock()
+        self.r.run_queue(self.urls, 'all')
+        queue = next(iter(self.r.state['_queues'].values()))
+        self.assertEqual(queue['cursor'], 0); self.assertFalse(queue['complete'])
+        self.assertEqual(self.c._request.call_count, 2); self.r.process.assert_not_called()
+        self.assertEqual(len(self.r.results), len(self.urls))
+        other = Runner(self.c, 'state.json', budget=10000)
+        self.c._request.side_effect = self.health
+        other.process = Mock(side_effect=lambda u: other.result(u, 'verified'))
+        other.run_queue([BASE + '/ignored-new-discovery'], 'all')
+        self.assertEqual([c.args[0] for c in other.process.call_args_list], self.urls)
+        self.assertTrue(all(r['state'] == 'verified' for r in other.results))
+    def test_budget_does_not_consume_untouched_cursor(self):
+        self.r.deadline = self.now + 100
+        self.r.process = Mock(); self.c._request = Mock()
+        self.r.run_queue(self.urls, 'all')
+        queue = next(iter(self.r.state['_queues'].values()))
+        self.assertEqual(queue['cursor'], 0); self.assertFalse(queue['complete'])
+        self.r.process.assert_not_called(); self.c._request.assert_not_called()
+    def test_expired_cooldown_still_requires_probe_and_429_honored(self):
+        self.r.state['_transport_cooldown_until'] = self.now - 1
+        self.c._request = Mock(side_effect=lambda u: (429, {'Retry-After': '7200'}, '{}', u))
+        self.r.deadline = self.now + 3000
+        self.r.process = Mock(); self.r.run_queue(self.urls, 'all')
+        self.r.process.assert_not_called()
+        self.assertGreaterEqual(self.r.state['_transport_cooldown_until'], self.now + 7200)
+    def test_crash_marker_skipped_pending_untouched(self):
+        key = 'all:' + timestamp(self.r.since)[:8] + ':capture'
+        unknown = {'submitted_at': self.now - 100, 'job_id': None}
+        self.r.state[self.urls[0]] = dict(unknown)
+        self.r.state['_queues'] = {key: {'urls': self.urls, 'cursor': 0, 'results': [], 'complete': False, 'started': self.urls[0]}}
+        self.r.process = Mock(side_effect=self.operation)
+        self.r.run_queue(self.urls, 'all')
+        self.assertEqual([c.args[0] for c in self.r.process.call_args_list], self.urls[1:])
+        self.assertEqual(self.r.state[self.urls[0]], unknown)
+        self.assertEqual(self.r.results[0]['state'], 'unverified')
+    def test_namespaces_and_completed_queue_rebuild(self):
+        self.r.deadline = self.now + 100
+        self.r.run_queue(self.urls, 'all')
+        original = json.loads(json.dumps(self.r.state['_queues']))
+        self.r.run_queue([BASE + '/probe'], 'transport_probe')
+        for key, value in original.items(): self.assertEqual(self.r.state['_queues'][key], value)
+        self.assertEqual(len(self.r.state['_queues']), 2)
+        self.r.deadline = self.now + 10000
+        self.r.process = Mock(side_effect=self.operation)
+        self.r.run_queue(self.urls, 'all')
+        self.r.results = []
+        self.r.run_queue(self.urls, 'all')
+        self.assertEqual(self.r.process.call_count, len(self.urls)*2)
+    def test_probe_rejects_redirect_or_bad_json(self):
+        for response in [(200, {}, '{}', 'https://example.org/'), (200, {}, 'not-json', '')]:
+            self.c._request = Mock(return_value=response)
+            self.assertFalse(self.r.recover_transport())
+            self.assertEqual(self.c._request.call_count, 1)
+    def test_two_recovery_cycles_global_even_when_both_succeed(self):
+        urls = self.urls * 1 + [BASE + '/pages/test-' + str(i) for i in range(7, 12)]
+        calls = []
+        def operation(url):
+            calls.append(url)
+            if len(calls) % 3 == 0:
+                self.r.transport_circuit_open = True
+                self.r.state['_transport_cooldown_until'] = self.now + 900
+            return self.r.result(url, 'unverified')
+        self.r.process = Mock(side_effect=operation)
+        self.c._request = Mock(side_effect=self.health)
+        self.r.run_queue(urls, 'all')
+        queue = next(iter(self.r.state['_queues'].values()))
+        self.assertEqual(len(calls), 9)
+        self.assertEqual(self.c._request.call_count, 8)
+        self.assertEqual(queue['cursor'], 9); self.assertFalse(queue['complete'])
+        self.assertEqual([r['url'] for r in self.r.results if r['state'] == 'deferred'], urls[9:])
+
+    def test_operation_deferred_does_not_consume_cursor(self):
+        self.r.process = Mock(side_effect=lambda u: self.r.result(u, 'deferred', reason='budget', queue_untouched=True))
+        self.r.run_queue(self.urls, 'all')
+        queue = next(iter(self.r.state['_queues'].values()))
+        self.assertEqual(queue['cursor'], 0)
+        self.assertFalse(queue['complete'])
+        self.assertEqual(queue['results'], [])
+        self.assertEqual(len(self.r.results), len(self.urls))
+    def test_per_url_deferral_does_not_block_untouched_pages(self):
+        self.r.process = Mock(side_effect=lambda u: self.r.result(u, 'deferred', reason='completed reused capture awaiting eligibility'))
+        self.r.run_queue(self.urls, 'all')
+        queue = next(iter(self.r.state['_queues'].values()))
+        self.assertEqual(queue['cursor'], len(self.urls))
+        self.assertTrue(queue['complete'])
+        self.assertEqual(self.r.process.call_count, len(self.urls))
+        self.assertTrue(all(r['state'] == 'deferred' for r in queue['results']))
+
+    def test_next_day_does_not_reuse_yesterday_cursor(self):
+        key = 'all:20261101:capture'
+        self.r.state['_queues'] = {key: {'urls': self.urls, 'cursor': 4, 'results': [], 'complete': False}}
+        self.r.process = Mock(side_effect=self.operation)
+        self.r.run_queue(self.urls, 'all')
+        self.assertNotIn(key, self.r.state['_queues'])
+        self.assertEqual(self.r.process.call_count, len(self.urls))
+
+    def test_fixed_probe_scope(self):
+        from capture import main, TRANSPORT_PROBE
+        with patch('sys.argv', ['capture.py', '--scope', 'transport_probe']), patch('capture.Runner.run_queue') as queue, patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}):
+            main()
+        queue.assert_called_once_with([TRANSPORT_PROBE], 'transport_probe')
+        self.assertEqual(TRANSPORT_PROBE, BASE + '/products/date-mod-ice-blue-arabic-watch')
 
 class WorkflowTests(unittest.TestCase):
     def test_recovery_cache_is_not_promoted_to_production(self):

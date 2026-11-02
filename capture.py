@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import gzip
 import html
+import http.client
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ PRIORITY = ['/', '/policies/refund-policy', '/policies/shipping-policy',
  '/policies/contact-information', '/policies/legal-notice', '/pages/contact',
  '/pages/warranty-policy', '/pages/no-brand-affiliation',
  '/policies/subscription-policy', '/cart', '/cart/51183558787357:1?storefront=true']
+TRANSPORT_PROBE = BASE + '/products/date-mod-ice-blue-arabic-watch'
 UTC = dt.timezone.utc
 
 def timestamp(epoch):
@@ -76,18 +78,60 @@ def response_metadata(http_status, headers, obj):
     return result
 
 class LookupFailure(Exception):
-    pass
+    def __init__(self, message, transport=None):
+        super().__init__(message)
+        self.transport = transport
+
+
+class TrackedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, transport_tracker, **kwargs):
+        super().__init__(*args, **kwargs)
+        create_connection = self._create_connection
+
+        def tracked_create(*connection_args, **connection_kwargs):
+            transport_tracker['tcp_connect_attempted'] = True
+            try:
+                sock = create_connection(*connection_args, **connection_kwargs)
+            except OSError:
+                # Proof is deliberately narrow: no socket was returned. TLS,
+                # proxy CONNECT, send and read failures never receive this proof.
+                transport_tracker['tcp_connect_failed'] = True
+                raise
+            transport_tracker['tcp_established'] = True
+            return sock
+
+        self._create_connection = tracked_create
+
+
+class TrackedHTTPSHandler(ur.HTTPSHandler):
+    def __init__(self, tracker):
+        super().__init__()  # Keep stdlib certificate/hostname validation.
+        self.tracker = tracker
+
+    def https_open(self, req):
+        def connection(*args, **kwargs):
+            return TrackedHTTPSConnection(*args, transport_tracker=self.tracker, **kwargs)
+        return self.do_open(connection, req, context=self._context)
+
 
 class NoRedirect(ur.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None  # Never forward Archive authorization to a redirect destination.
 
 class Client:
+    def __init__(self):
+        self.archive_transport_failures = 0
+        self.archive_healthy_responses = 0
+        self.post_retry_deadline = 0  # Runner grants a bounded remaining budget.
+        self.post_retry_not_before = 0
+        self.post_attempt_callback = None
+
     def request(self, url, data=None, authenticated=False):
-        # Read endpoints can fail transiently. Never retry a POST whose outcome
-        # might already have created a job. Pace public archive reads as well.
-        for attempt in range(2 if data is None else 1):
-            if data is None and up.urlsplit(url).hostname == 'web.archive.org':
+        is_archive = up.urlsplit(url).hostname == 'web.archive.org'
+        for attempt in range(2):
+            if data is not None and self.post_attempt_callback is not None:
+                self.post_attempt_callback({'attempt': attempt + 1, 'started_at': time.time()})
+            if data is None and is_archive:
                 wait = max(0, getattr(self, '_last_read', 0) + 2 - time.time())
                 if wait:
                     time.sleep(wait)
@@ -97,37 +141,70 @@ class Client:
                 if data is None and not authenticated and response[0] in (429, 502, 503, 504) and attempt == 0:
                     time.sleep(30)
                     continue
+                if is_archive and 200 <= response[0] < 400:
+                    self.archive_healthy_responses += 1
                 return response
-            except LookupFailure:
-                if data is not None or attempt == 1:
-                    raise
-                time.sleep(10)
+            except LookupFailure as exc:
+                if data is not None:
+                    proof = exc.transport or {}
+                    wait = max(60, self.post_retry_not_before - time.time())
+                    may_retry = (attempt == 0 and proof.get('known_not_sent') is True
+                                 and time.time() + wait + 35 < self.post_retry_deadline)
+                    if may_retry:
+                        time.sleep(wait)
+                        continue
+                elif attempt == 0:
+                    time.sleep(10)
+                    continue
+                if is_archive and exc.transport:
+                    # Count the exhausted logical request, not its retry attempts.
+                    self.archive_transport_failures += 1
+                raise
 
     def _request(self, url, data=None, authenticated=False):
         headers = {'User-Agent': 'SWC-Archive-Verification/1.0', 'Accept-Encoding': 'identity'}
         if authenticated:
+            target = up.urlsplit(url)
+            if (target.scheme != 'https' or target.netloc != 'web.archive.org'
+                    or not re.fullmatch(r'/save/?|/save/status/[A-Za-z0-9_-]+', target.path)
+                    or target.query or target.fragment):
+                raise LookupFailure('Authenticated endpoint is outside SPN scope')
             access, secret = os.environ.get('ARCHIVE_ORG_ACCESS_KEY'), os.environ.get('ARCHIVE_ORG_SECRET_KEY')
             if not access or not secret:
                 raise LookupFailure('Archive credentials are not configured')
-            # Only the SPN endpoint receives this header; never log it.
             headers['Authorization'] = 'LOW ' + access + ':' + secret
             headers['Accept'] = 'application/json'
         req = ur.Request(url, data=up.urlencode(data).encode() if data else None, headers=headers)
+        tracker = {'tcp_connect_attempted': False, 'tcp_connect_failed': False, 'tcp_established': False}
+        handlers = [TrackedHTTPSHandler(tracker)]
+        if authenticated:
+            handlers.append(NoRedirect())
+        phase = 'open'
         try:
-            response = (ur.build_opener(NoRedirect()).open(req, timeout=30)
-                        if authenticated else ur.urlopen(req, timeout=30))
-        except urllib.error.HTTPError as exc:
-            response = exc
-        except (OSError, TimeoutError) as exc:
+            try:
+                response = ur.build_opener(*handlers).open(req, timeout=30)
+            except urllib.error.HTTPError as exc:
+                response = exc
+            with response:
+                phase = 'read'
+                body = response.read(8 * 1024 * 1024 + 1)
+                if len(body) > 8 * 1024 * 1024:
+                    raise LookupFailure('Response exceeds verification size limit')
+                phase = 'decode'
+                if body[:2] == b'\x1f\x8b':
+                    body = gzip.decompress(body)
+                return response.status, dict(response.headers.items()), body.decode('utf-8', errors='replace'), response.url
+        except (OSError, TimeoutError, http.client.HTTPException) as exc:
             reason = getattr(exc, 'reason', exc)
-            raise LookupFailure('Network read failed: ' + type(reason).__name__) from None
-        with response:
-            body = response.read(8 * 1024 * 1024 + 1)
-            if len(body) > 8 * 1024 * 1024:
-                raise LookupFailure('Response exceeds verification size limit')
-            if body[:2] == b'\x1f\x8b':
-                body = gzip.decompress(body)
-            return response.status, dict(response.headers.items()), body.decode('utf-8', errors='replace'), response.url
+            known_not_sent = (phase == 'open' and tracker['tcp_connect_failed']
+                              and not tracker['tcp_established'])
+            detail = {'phase': 'tcp_connect' if known_not_sent else phase,
+                      'reason_class': type(reason).__name__,
+                      'known_not_sent': known_not_sent}
+            number = getattr(reason, 'errno', None)
+            if isinstance(number, int):
+                detail['errno'] = number
+            raise LookupFailure('Network operation failed: ' + type(reason).__name__, transport=detail) from None
 
     def json(self, url, data=None, authenticated=False):
         status, headers, body, _ = self.request(url, data, authenticated)
@@ -295,6 +372,9 @@ class Runner:
         self.poll_only = poll_only
         self.next_submit = self.state.get('_next_submit', 0)
         self.results = []
+        self.transport_failure_streak = 0
+        self.transport_circuit_open = False
+        self.client.post_retry_deadline = self.deadline
 
     def save(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -312,7 +392,7 @@ class Runner:
             row['job_id'] = job_id
         if isinstance(pending.get('submitted_at'), (int, float)):
             row['submitted_at'] = pending['submitted_at']
-        for key in ('status_evidence', 'request_evidence', 'terminal_reused', 'retry_eligible_at', 'review_required', 'submission_response', 'status_response'):
+        for key in ('status_evidence', 'request_evidence', 'terminal_reused', 'retry_eligible_at', 'review_required', 'submission_response', 'status_response', 'transport_failure', 'known_not_sent'):
             if key in pending:
                 row[key] = pending[key]
         self.results.append(row)
@@ -377,8 +457,136 @@ class Runner:
         return self.result(url, 'reused', reason='completed capture predates UTC day; no new submission in this run')
 
     def process(self, url):
+        # A per-run circuit counts URL operations with exhausted Archive
+        # transport failures; successful intermediate CDX reads cannot erase a
+        # subsequent failed POST/status lookup for the same URL.
+        if self.transport_circuit_open or self.state.get('_transport_cooldown_until', 0) > time.time():
+            return self.result(url, 'deferred', reason='local transport circuit cooldown; no network requests made', queue_untouched=True)
+        before_failed = getattr(self.client, 'archive_transport_failures', 0)
+        before_healthy = getattr(self.client, 'archive_healthy_responses', 0)
+        self._operation_transport_failed = False
+        row = self._process(url)
+        after_failed = getattr(self.client, 'archive_transport_failures', 0)
+        after_healthy = getattr(self.client, 'archive_healthy_responses', 0)
+        failed = self._operation_transport_failed or (isinstance(before_failed, int) and isinstance(after_failed, int) and after_failed > before_failed)
+        healthy = isinstance(before_healthy, int) and isinstance(after_healthy, int) and after_healthy > before_healthy
+        if failed:
+            self.transport_failure_streak += 1
+        elif healthy:
+            self.transport_failure_streak = 0
+        if self.transport_failure_streak >= 3:
+            self.transport_circuit_open = True
+            until = time.time() + 900  # Local conservative policy, not Archive's limit.
+            self.state['_transport_cooldown_until'] = until
+            self.state['_next_submit'] = self.next_submit = max(self.next_submit, until)
+            self.save()
+            row['transport_circuit'] = 'opened_after_three_transport_failed_url_operations'
+            Path('capture-report.json').write_text(json.dumps(self.results, indent=2))
+        return row
+
+    def recover_transport(self):
+        """Bounded public GET-only health gate, not proof of capture coverage."""
+        until = max(self.state.get('_transport_cooldown_until', 0), self.next_submit)
+        # Four 35s HTTP timeouts plus the 30s interval and one URL operation.
+        if time.time() + max(0, until - time.time()) + 210 >= self.deadline:
+            return False
+        time.sleep(max(0, until - time.time()))
+        query = up.urlencode({'url': BASE + '/pages/warranty-policy',
+            'matchType': 'exact', 'from': timestamp(self.since), 'output': 'json',
+            'fl': 'timestamp,original,statuscode,mimetype'})
+        endpoints = [('https://web.archive.org/save/status/system', dict),
+                     ('https://web.archive.org/cdx/search/cdx?' + query, list)]
+        for pass_number in range(2):
+            if pass_number:
+                time.sleep(30)
+            for endpoint, expected in endpoints:
+                retry_until = 0
+                try:
+                    # Bypass retry orchestration, NOT proxy/TLS: one normal
+                    # unauthenticated GET per endpoint/pass, no credentials.
+                    code, headers, body, final = self.client._request(endpoint)
+                    metadata = response_metadata(code, {k.lower(): v for k, v in headers.items()}, {})
+                    retry_until = metadata.get('retry_after_until', 0)
+                    healthy = code == 200 and final == endpoint and isinstance(json.loads(body), expected)
+                except (LookupFailure, ValueError, TypeError):
+                    healthy = False
+                if not healthy:
+                    until = max(time.time() + 900, retry_until, self.next_submit)
+                    self.state['_transport_cooldown_until'] = until
+                    self.state['_next_submit'] = self.next_submit = until
+                    self.save()
+                    return False
+        self.transport_circuit_open = False
+        self.transport_failure_streak = 0
+        self.state.pop('_transport_cooldown_until', None)
+        self.save()
+        return True
+
+    def run_queue(self, urls, scope):
+        """Checkpoint untouched work; a cursor is never a coverage claim."""
+        mode = 'verify' if self.verify_only else 'poll' if self.poll_only else 'capture'
+        key = scope + ':' + timestamp(self.since)[:8] + ':' + mode
+        queues = self.state.setdefault('_queues', {})
+        # Yesterday's cursors must not suppress today's daily capture goal.
+        for old in list(queues):
+            if ':' + timestamp(self.since)[:8] + ':' not in old:
+                del queues[old]
+        queue = queues.get(key)
+        if not queue or queue.get('complete'):
+            queue = {'urls': list(dict.fromkeys(urls)), 'cursor': 0,
+                     'results': [], 'complete': False}
+            queues[key] = queue
+        self.results.extend(queue['results'])
+        # Save before dispatch. A crash after start cannot lead to a blind
+        # replay of a possibly sent submission, even without a job ID.
+        if queue.get('started') is not None:
+            url = queue['urls'][queue['cursor']]
+            self.result(url, 'unverified', reason='interrupted URL operation; resume skips it, pending state preserved')
+            queue['results'] = list(self.results)
+            queue['cursor'] += 1
+            queue.pop('started', None)
+        self.save()
+        cycles = 0
+        while queue['cursor'] < len(queue['urls']):
+            if time.time() + 120 >= self.deadline:
+                break
+            if self.transport_circuit_open or '_transport_cooldown_until' in self.state:
+                if cycles >= 2:
+                    break
+                cycles += 1
+                if not self.recover_transport():
+                    if time.time() + 1110 >= self.deadline:
+                        break
+                    continue
+            url = queue['urls'][queue['cursor']]
+            queue['started'] = url
+            self.save()
+            if scope == 'supplemental' and url == BASE + '/agents.md':
+                self.result(url, 'unsupported-document-type', content_type='text/markdown',
+                            reason='published text document is outside the HTML verifier; no submission made')
+            else:
+                row = self.process(url)
+                if isinstance(row, dict) and row.get('queue_untouched') is True:
+                    # No completed operation: retain this untouched cursor.
+                    # Its transient report is not checkpointed as processed.
+                    self.results.pop()
+                    queue.pop('started', None)
+                    self.save()
+                    break
+            queue['cursor'] += 1
+            queue.pop('started', None)
+            queue['results'] = list(self.results)
+            self.save()
+        queue['complete'] = queue['cursor'] == len(queue['urls'])
+        self.save()
+        # These reporting rows do not advance the saved cursor/results.
+        for url in queue['urls'][queue['cursor']:]:
+            self.result(url, 'deferred', reason='untouched queue checkpoint saved; recovery cycles or run budget exhausted')
+
+    def _process(self, url):
+        created_pending = False
         if time.time() + 35 >= self.deadline:
-            return self.result(url, 'deferred', reason='run time budget')
+            return self.result(url, 'deferred', reason='run time budget', queue_untouched=True)
         try:
             evidence = self.client.verify(url, self.since)
             if evidence:
@@ -386,6 +594,13 @@ class Runner:
                 self.save()
                 return self.result(url, 'verified', coverage_source='existing_index', new_capture=False, **evidence)
             pending = self.state.get(url)
+            created_pending = False
+            if pending and pending.get('known_not_sent') is True and not pending.get('job_id') and not (self.verify_only or self.poll_only):
+                # This explicit marker is written only by the instrumented new
+                # attempt path. Historical no-job states are never promoted.
+                self.state.pop(url)
+                self.save()
+                pending = None
             if pending and not pending.get('terminal_reused'):
                 # Migrate saved successes (including earlier releases) by
                 # read-only exact CDX/replay, without requiring a live job ID.
@@ -413,7 +628,7 @@ class Runner:
             if not pending:
                 delay = max(0, self.next_submit - time.time())
                 if time.time() + delay + 120 >= self.deadline:
-                    return self.result(url, 'deferred', reason='host cooldown/time budget')
+                    return self.result(url, 'deferred', reason='host cooldown/time budget', queue_untouched=True)
                 if delay:
                     print('Waiting %ss before next submission' % int(delay), flush=True)
                     time.sleep(delay)
@@ -422,8 +637,19 @@ class Runner:
                                          'if_not_archived_within': '1'}}
                 # Persist BEFORE POST: a network timeout has an uncertain outcome.
                 self.state[url] = pending
+                created_pending = True
                 self.state['_next_submit'] = self.next_submit = time.time() + self.interval
                 self.save()
+                self.client.post_retry_not_before = self.next_submit
+                def record_attempt(attempt):
+                    pending['request_evidence'].setdefault('attempts', []).append(attempt)
+                    # Pace the next URL from the latest physical attempt, not
+                    # the original attempt before a safe retry's delay.
+                    self.state['_next_submit'] = self.next_submit = max(
+                        self.next_submit, attempt['started_at'] + self.interval)
+                    self.client.post_retry_not_before = self.next_submit
+                    self.save()  # Audit each bounded attempt before any network IO.
+                self.client.post_attempt_callback = record_attempt
                 status, headers, obj = self.client.json('https://web.archive.org/save/',
                     {'url': url, 'if_not_archived_within': '1'}, True)
                 if not isinstance(obj, dict):
@@ -516,6 +742,18 @@ class Runner:
                 time.sleep(10)
             return self.result(url, 'pending', reason='job or independent index verification pending')
         except (LookupFailure, ValueError, OSError) as exc:
+            detail = getattr(exc, 'transport', None)
+            if detail:
+                self._operation_transport_failed = True
+                pending = self.state.get(url)
+                if pending:
+                    pending['transport_failure'] = detail
+                    if created_pending and not pending.get('job_id') and detail.get('known_not_sent') is True:
+                        pending['known_not_sent'] = True
+                        pending['retry_not_before'] = max(self.next_submit, time.time() + 60)
+                        self.state['_next_submit'] = self.next_submit = pending['retry_not_before']
+                    self.save()
+                return self.result(url, 'unverified', reason='Archive transport failed', transport=detail)
             return self.result(url, 'unverified', reason=str(exc))
 
 def main():
@@ -523,13 +761,15 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--verify-only', action='store_true')
     mode.add_argument('--poll-only', action='store_true', help='Read existing job status and archive evidence; never submit')
-    parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental'), default='all')
+    parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental', 'transport_probe'), default='all')
     parser.add_argument('--state', default='.capture-state/pending.json')
     parser.add_argument('--budget', type=int, default=17400)
     args = parser.parse_args()
     client = Client()
     runner = Runner(client, args.state, args.budget, verify_only=args.verify_only, poll_only=args.poll_only)
     urls = [] if args.scope == 'supplemental' else [BASE + p for p in (['/pages/warranty-policy'] if args.scope == 'pilot' else PRIORITY)]
+    if args.scope == 'transport_probe':
+        urls = [TRANSPORT_PROBE]
     if args.scope == 'supplemental':
         try:
             urls = discover_supplemental(client)
@@ -537,22 +777,12 @@ def main():
                 runner.result(BASE + '/sitemap.xml', 'no-additional-targets', reason='published sitemap is fully covered by existing all-scope inventory')
         except LookupFailure as exc:
             runner.result(BASE + '/sitemap.xml', 'discovery-incomplete', reason=str(exc))
-    for url in urls:
-        if args.scope == 'supplemental' and url == BASE + '/agents.md':
-            # Observed live as text/markdown. Keep it visible in the inventory
-            # without submitting a capture our HTML-only verifier cannot prove.
-            runner.result(url, 'unsupported-document-type', content_type='text/markdown',
-                          reason='published text document is outside the HTML verifier; no submission made')
-            continue
-        # A dispatch gets one submission opportunity per URL. A host refusal
-        # preserves cooldown but never triggers another POST in this run.
-        runner.process(url)
     if args.scope == 'all':
         try:
-            for url in discover(client):
-                runner.process(url)
+            urls.extend(discover(client))
         except LookupFailure as exc:
             runner.result(BASE + '/collections/all', 'discovery-incomplete', reason=str(exc))
+    runner.run_queue(urls, args.scope)
     counts = {state: sum(r['state'] == state for r in runner.results) for state in sorted({r['state'] for r in runner.results})}
     summary = 'UTC date: %s\n\nResults: %s\n\nFull per-URL evidence is in capture-report.json.\n' % (timestamp(runner.since)[:8], json.dumps(counts))
     print(summary)
