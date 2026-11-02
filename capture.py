@@ -346,12 +346,9 @@ def main():
     runner = Runner(client, args.state, args.budget, verify_only=args.verify_only, poll_only=args.poll_only)
     urls = [BASE + p for p in (['/pages/warranty-policy'] if args.scope == 'pilot' else PRIORITY)]
     for url in urls:
-        result = runner.process(url)
-        if args.scope == 'pilot' and result['state'] == 'deferred' and runner.next_submit > time.time():
-            # One controlled retry after a confirmed refusal and persisted cooldown.
-            # Keep one final record per URL, rather than miscounting both attempts.
-            runner.results.pop()
-            runner.process(url)
+        # A dispatch gets one submission opportunity per URL. A host refusal
+        # preserves cooldown but never triggers another POST in this run.
+        runner.process(url)
     if args.scope == 'all':
         try:
             for url in discover(client):

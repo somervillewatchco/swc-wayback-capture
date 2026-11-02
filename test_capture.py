@@ -274,6 +274,21 @@ class RunnerTests(unittest.TestCase):
             main()
         self.assertEqual(path.read_text(), 'real summary')
 
+    def test_pilot_main_host_pause_has_one_submission_only(self):
+        from capture import main
+        self.c.json.return_value = (429, {'retry-after': '660'},
+                                    {'status_ext': 'error:host-crawling-paused'})
+        with patch('sys.argv', ['capture.py', '--scope', 'pilot']), patch('capture.Client', return_value=self.c):
+            self.assertEqual(main(), 1)
+        self.assertEqual(self.c.json.call_count, 1)
+        self.assertEqual(self.c.verify.call_count, 1)
+        self.assertEqual(self.c.json.call_args.args[0], 'https://web.archive.org/save/')
+        saved = json.loads(Path('.capture-state/pending.json').read_text())
+        self.assertGreater(saved['_next_submit'], time.time() + 659)
+        report = json.loads(Path('capture-report.json').read_text())
+        self.assertEqual(len(report), 1)
+        self.assertEqual(report[0]['state'], 'deferred')
+
     def test_incomplete_main_returns_nonzero(self):
         from capture import main
         with patch('sys.argv', ['capture.py', '--verify-only', '--scope', 'pilot']), patch('capture.Client', return_value=self.c):
