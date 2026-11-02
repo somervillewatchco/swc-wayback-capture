@@ -14,6 +14,10 @@ on:
         description: 'Read archive evidence without submitting captures'
         type: boolean
         default: true
+      diagnostic:
+        description: 'Public GET-only transport diagnosis; no captures or state cache changes'
+        type: boolean
+        default: false
       recovery_cache_key:
         description: 'Optional exact prior state cache to recover; forces no-submission polling'
         type: string
@@ -33,14 +37,16 @@ jobs:
         with:
           python-version: '3.12'
       - name: Offline regression tests
-        run: env -u GITHUB_STEP_SUMMARY python -m unittest -v test_capture
+        run: env -u GITHUB_STEP_SUMMARY python -m unittest -v test_capture test_diagnose_transport
       - name: Restore unresolved jobs and host cooldown
+        if: ${{ !inputs.diagnostic }}
         uses: actions/cache/restore@v4
         with:
           path: .capture-state
           key: ${{ inputs.recovery_cache_key || format('wayback-state-v1-{0}-{1}', github.run_id, github.run_attempt) }}
           restore-keys: ${{ !inputs.recovery_cache_key && 'wayback-state-v1-' || '' }}
       - name: Capture and independently verify
+        if: ${{ !inputs.diagnostic }}
         env:
           ARCHIVE_ORG_ACCESS_KEY: ${{ secrets.ARCHIVE_ORG_ACCESS_KEY }}
           ARCHIVE_ORG_SECRET_KEY: ${{ secrets.ARCHIVE_ORG_SECRET_KEY }}
@@ -56,16 +62,28 @@ jobs:
           fi
           python capture.py "${args[@]}"
       - name: Preserve unresolved jobs even when verification fails
-        if: always()
+        if: ${{ always() && !inputs.diagnostic }}
         uses: actions/cache/save@v4
         with:
           path: .capture-state
           key: ${{ inputs.recovery_cache_key && 'wayback-recovery-v1' || 'wayback-state-v1' }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Publish per-URL evidence
-        if: always()
+        if: ${{ always() && !inputs.diagnostic }}
         uses: actions/upload-artifact@v4
         with:
           name: capture-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: capture-report.json
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Public read-only transport diagnostics
+        if: ${{ inputs.diagnostic }}
+        timeout-minutes: 5
+        run: python diagnose_transport.py
+      - name: Publish sanitized transport evidence
+        if: ${{ always() && inputs.diagnostic }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: transport-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: transport-report.json
           if-no-files-found: warn
           retention-days: 90
