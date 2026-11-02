@@ -10,6 +10,11 @@ on:
         type: choice
         options: [pilot, priority, all, supplemental, transport_probe, pacing_probe, pacing_job_diagnostic, account_diagnostic, supplemental_probe, outlink_probe]
         default: pilot
+      outlink_page:
+        description: 'Single Shop All outlink page (only for outlink_probe; never a bulk loop)'
+        type: choice
+        options: ['1', '2', '3', '4', '5', '6']
+        default: '1'
       verify_only:
         description: 'Read archive evidence without submitting captures'
         type: boolean
@@ -55,10 +60,11 @@ jobs:
           ARCHIVE_ORG_ACCESS_KEY: ${{ secrets.ARCHIVE_ORG_ACCESS_KEY }}
           ARCHIVE_ORG_SECRET_KEY: ${{ secrets.ARCHIVE_ORG_SECRET_KEY }}
           RECOVERY_CACHE_KEY: ${{ inputs.recovery_cache_key }}
+          OUTLINK_PAGE: ${{ inputs.outlink_page || '1' }}
           SCOPE: ${{ inputs.scope || 'all' }}
           VERIFY_ONLY: ${{ inputs.verify_only && 'true' || 'false' }}
         run: |
-          args=(--scope "$SCOPE")
+          args=(--scope "$SCOPE" --outlink-page "$OUTLINK_PAGE")
           if [[ -n "$RECOVERY_CACHE_KEY" ]]; then
             args+=(--poll-only)
           elif [[ "$VERIFY_ONLY" == true ]]; then
