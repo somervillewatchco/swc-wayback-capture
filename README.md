@@ -214,3 +214,27 @@ Official documentation warns this no-query endpoint can return cached data.
 established. HTTP200/valid schema does not independently prove current credentials
 work or that capacity existed at a previous capture failure. This observation
 cannot explain a past reported400 by itself and never counts as verified coverage.
+
+### Guarded supplemental About Us canary
+
+Manual scope `supplemental_probe` selects only
+`https://somervillewatchco.com/pages/about-us` from the approved supplemental HTML
+inventory. It has a maximum30-minute budget and does not enumerate or submit a
+batch. **Any existing saved entry for that URL**—including unknown, reviewed,
+terminal-reused or proven-not-sent state—or a completed audit entry stops the
+canary for review without clearing/releasing that history. The guard is checked
+both before and after the mandatory health gate.
+
+For an untouched target, the existing two-pass paced health gate must pass even
+when no prior circuit/cooldown exists. A failed gate ends this scope immediately,
+without CDX lookup or POST. Only then does the ordinary strict current-day CDX /
+exact replay check run: existing usable evidence skips submission; a lookup error
+never means absence. Otherwise the same existing one-URL submission/state machine
+applies, with global120-second pacing, stricter cooldowns and only the previously
+reviewed proven-TCP-not-sent physical retry. No form options, endpoint, credentials
+or authorization behavior change. Pending outcomes stay protected.
+
+The canary has its own scope/day/mode checkpoint and does not advance, prune or
+replace another scope's queue, including the existing all-scope cursor and prior
+probes. Passing health checks does not establish capture coverage or prove that
+the previously observed failure is fixed. Throughput limitations remain unchanged.

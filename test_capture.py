@@ -1403,6 +1403,80 @@ class GlobalArchivePacingTests(unittest.TestCase):
                 runner.return_value.run_queue.assert_not_called();runner.return_value.process.assert_not_called()
                 discover.assert_not_called();supplemental.assert_not_called()
 
+    def test_supplemental_probe_always_forces_gate_and_only_about_us(self):
+        from capture import SUPPLEMENTAL_PROBE
+        self.r.recover_transport=Mock(return_value=True)
+        self.r.run_queue=Mock()
+        self.r.run_supplemental_probe()
+        self.r.recover_transport.assert_called_once_with(cycle=1)
+        self.r.run_queue.assert_called_once_with([SUPPLEMENTAL_PROBE],'supplemental_probe')
+        self.assertEqual(SUPPLEMENTAL_PROBE,BASE+'/pages/about-us')
+    def test_supplemental_probe_failed_gate_never_checks_cdx_or_posts(self):
+        self.r.recover_transport=Mock(return_value=False)
+        self.c.verify=Mock()
+        row=self.r.run_supplemental_probe()
+        self.assertEqual(row['state'],'deferred')
+        self.c.verify.assert_not_called();self.c._request.assert_not_called()
+        self.assertNotIn('_queues',self.r.state)
+    def test_supplemental_probe_any_saved_entry_is_untouched(self):
+        from capture import SUPPLEMENTAL_PROBE
+        self.r.recover_transport=Mock()
+        for pending in (None,{}, {'job_id':'existing','review_required':True},
+                        {'known_not_sent':True,'job_id':None},
+                        {'terminal_reused':{'timestamp':'20261101000000'},'retry_eligible_at':0}):
+            self.r.state[SUPPLEMENTAL_PROBE]=pending
+            before=json.loads(json.dumps(self.r.state))
+            self.assertEqual(self.r.run_supplemental_probe()['state'],'review_required')
+            self.assertEqual(self.r.state,before)
+        self.r.recover_transport.assert_not_called();self.c._request.assert_not_called()
+    def test_supplemental_probe_completed_audit_also_prevents_repost(self):
+        from capture import SUPPLEMENTAL_PROBE
+        self.r.state['_completed_jobs']=[{'url':SUPPLEMENTAL_PROBE,'state':'failed'}]
+        self.r.recover_transport=Mock()
+        self.assertEqual(self.r.run_supplemental_probe()['state'],'review_required')
+        self.r.recover_transport.assert_not_called();self.c._request.assert_not_called()
+    def test_supplemental_probe_rechecks_protected_state_after_gate(self):
+        from capture import SUPPLEMENTAL_PROBE
+        def gate(**kwargs):
+            self.r.state[SUPPLEMENTAL_PROBE]={'known_not_sent':True};return True
+        self.r.recover_transport=Mock(side_effect=gate)
+        self.assertEqual(self.r.run_supplemental_probe()['state'],'review_required')
+        self.c._request.assert_not_called()
+        self.assertEqual(self.r.state[SUPPLEMENTAL_PROBE],{'known_not_sent':True})
+    def test_supplemental_probe_fresh_cdx_skips_post_and_preserves_other_queues(self):
+        from capture import SUPPLEMENTAL_PROBE
+        self.r.recover_transport=Mock(return_value=True)
+        self.c.verify=Mock(return_value={'timestamp':timestamp(self.now-60),'replay':'verified'})
+        queues={'all:20261101:capture':{'cursor':5,'complete':False},
+                'pacing_probe:20261102:capture':{'cursor':1,'complete':True}}
+        self.r.state['_queues']=json.loads(json.dumps(queues))
+        self.assertEqual(self.r.run_supplemental_probe()['state'],'verified')
+        self.c.verify.assert_called_once_with(SUPPLEMENTAL_PROBE,self.r.since)
+        self.c._request.assert_not_called()
+        for key in queues:self.assertEqual(self.r.state['_queues'][key],queues[key])
+        own=[q for key,q in self.r.state['_queues'].items() if key.startswith('supplemental_probe:')]
+        self.assertEqual(len(own),1);self.assertEqual(own[0]['urls'],[SUPPLEMENTAL_PROBE])
+    def test_supplemental_probe_rejects_saved_queue_with_other_targets(self):
+        from capture import SUPPLEMENTAL_PROBE
+        self.r.recover_transport=Mock()
+        key='supplemental_probe:'+timestamp(self.r.since)[:8]+':capture'
+        for urls in ([URL],[SUPPLEMENTAL_PROBE,URL],[],None):
+            queue={'urls':urls,'cursor':0,'results':[],'complete':False}
+            self.r.state['_queues']={key:queue}
+            before=json.loads(json.dumps(queue))
+            self.assertEqual(self.r.run_supplemental_probe()['state'],'review_required')
+            self.assertEqual(self.r.state['_queues'][key],before)
+        self.r.recover_transport.assert_not_called();self.c._request.assert_not_called()
+
+    def test_supplemental_probe_main_budget_no_inventory_or_broad_queue(self):
+        from capture import main
+        with patch('sys.argv',['capture.py','--scope','supplemental_probe']),patch('capture.Runner') as runner,patch('capture.discover') as discover,patch('capture.discover_supplemental') as supplemental,patch.dict(os.environ,{'GITHUB_STEP_SUMMARY':''}):
+            runner.return_value.results=[]
+            main()
+            self.assertEqual(runner.call_args.args[2],1800)
+            runner.return_value.run_supplemental_probe.assert_called_once_with()
+            runner.return_value.run_queue.assert_not_called();discover.assert_not_called();supplemental.assert_not_called()
+
     def test_health_requests_obey_same_gate(self):
         def health(url,*args):
             self.calls.append((url,None,self.now));self.now+=5
