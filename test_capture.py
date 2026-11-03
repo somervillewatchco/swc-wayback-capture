@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import Mock, patch
+from test_support import seed_test_state
 from capture import Client, Runner, LookupFailure, BASE, identity, timestamp, usable_html, discover
 
 URL = BASE + '/'
@@ -144,6 +145,8 @@ class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.old = os.getcwd(); os.chdir(self.tmp.name); self.addCleanup(os.chdir, self.old)
+        seed_test_state()
+        seed_test_state('.capture-state/pending.json')
         self.c = Mock(); self.c.verify.return_value = None
         self.r = Runner(self.c, 'state.json', budget=200, interval=60)
         self.sleep = patch('capture.time.sleep').start(); self.addCleanup(patch.stopall)
@@ -166,6 +169,7 @@ class RunnerTests(unittest.TestCase):
     def test_delayed_index_eventually_verifies(self):
         self.c.verify.side_effect = [None, None, {'timestamp':timestamp(time.time())}]
         self.c.json.side_effect = [(200, {}, {'job_id':'job'})] + [(200, {}, {'status':'success','original_url':URL,'timestamp':timestamp(time.time())})]*2
+        self.assertEqual(self.r.process(URL)['state'], 'pending')
         self.assertEqual(self.r.process(URL)['state'], 'verified')
         self.assertNotIn(URL, self.r.state)
 
@@ -297,12 +301,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.r.state[URL]['job_id'], 'accepted-job')
         self.assertEqual(self.c.json.call_count, 1)
 
-    def test_terminal_failure_audit_is_bounded_and_excludes_arbitrary_state(self):
+    def test_terminal_failure_audit_is_append_only_and_excludes_arbitrary_state(self):
         self.r.state['_completed_jobs'] = [{'old': i} for i in range(50)]
         self.r.state[URL] = {'job_id': 'accepted-job', 'submitted_at': time.time(), 'raw_secret': 'SECRET'}
         self.r.terminal_failure(URL, reason='SPN error', status_ext='error:bad-request')
-        self.assertEqual(len(self.r.state['_completed_jobs']), 50)
-        self.assertEqual(self.r.state['_completed_jobs'][0], {'old': 1})
+        self.assertEqual(len(self.r.state['_completed_jobs']), 51)
+        self.assertEqual(self.r.state['_completed_jobs'][0], {'old': 0})
         self.assertNotIn('SECRET', json.dumps(self.r.state['_completed_jobs']))
     def test_rejected_submission_retains_request_audit_without_job(self):
         self.c.json.return_value = (401, {}, {'status': 'error', 'message': 'SECRET'})
@@ -442,7 +446,7 @@ class RunnerTests(unittest.TestCase):
         self.r.save()
         evidence = {'timestamp': ts, 'original': URL, 'statuscode': '200',
                     'mimetype': 'text/html', 'replay_url': 'https://web.archive.org/web/' + ts + 'id_/' + URL}
-        self.c.verify.side_effect = lambda url, since, until=None: evidence if until is not None else None
+        self.c.verify.side_effect = lambda url, since, until=None: evidence if until == since else None
         return evidence
 
     def test_saved_success_migrates_read_only_and_no_forever_poll(self):
@@ -455,7 +459,7 @@ class RunnerTests(unittest.TestCase):
         self.r.verify_only = False
         self.assertEqual(self.r.process(URL)['state'], 'deferred')
         self.c.json.assert_not_called()
-        self.assertEqual(len([c for c in self.c.verify.call_args_list if c.kwargs.get('until')]), 1)
+        self.assertEqual(len([c for c in self.c.verify.call_args_list if c.kwargs.get('until') == c.args[1]]), 1)
 
     def test_terminal_reused_next_day_one_regular_post_and_audit(self):
         self.old_success_state()
@@ -626,7 +630,7 @@ class RunnerTests(unittest.TestCase):
     def test_intermediate_healthy_cdx_does_not_mask_three_post_failures(self):
         self.c.archive_transport_failures = 0
         self.c.archive_healthy_responses = 0
-        def healthy_cdx(*args):
+        def healthy_cdx(*args, **kwargs):
             self.c.archive_healthy_responses += 1
             return None
         self.c.verify.side_effect = healthy_cdx
@@ -644,7 +648,7 @@ class RunnerTests(unittest.TestCase):
         self.c.verify.side_effect = LookupFailure('Network failure', transport={'known_not_sent': False})
         self.r.process(BASE + '/one'); self.r.process(BASE + '/two')
         self.assertEqual(self.r.transport_failure_streak, 2)
-        def healthy(*args):
+        def healthy(*args, **kwargs):
             self.c.archive_healthy_responses += 1
             return {'timestamp': timestamp(time.time())}
         self.c.verify.side_effect = healthy
@@ -896,6 +900,7 @@ class SitemapTests(unittest.TestCase):
     def test_supplemental_discovery_failure_does_not_process_priority(self):
         from capture import main
         with tempfile.TemporaryDirectory() as tmp, patch('sys.argv', ['capture.py', '--scope', 'supplemental', '--state', tmp + '/state.json']), patch('capture.discover_supplemental', side_effect=LookupFailure('failed')), patch('capture.Runner.process') as process, patch('capture.Runner.result') as result, patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}):
+            seed_test_state(tmp + '/state.json')
             self.assertEqual(main(), 1)
             process.assert_not_called()
             self.assertEqual(result.call_args.args[1], 'discovery-incomplete')
@@ -906,6 +911,7 @@ class SitemapTests(unittest.TestCase):
             old = os.getcwd()
             try:
                 os.chdir(tmp)
+                seed_test_state('.capture-state/pending.json')
                 with patch('sys.argv', ['capture.py', '--scope', 'supplemental']), patch('capture.discover_supplemental', return_value=[BASE + '/agents.md', BASE + '/pages/about']), patch('capture.Runner.process') as process, patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}):
                     self.assertEqual(main(), 1)
                     process.assert_called_once_with(BASE + '/pages/about')
@@ -921,6 +927,7 @@ class SitemapTests(unittest.TestCase):
             old = os.getcwd()
             try:
                 os.chdir(tmp)
+                seed_test_state('.capture-state/pending.json')
                 with patch('sys.argv', ['capture.py', '--scope', 'supplemental']), patch('capture.discover_supplemental', return_value=[]), patch('capture.Runner.process') as process, patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}):
                     self.assertEqual(main(), 0)
                     process.assert_not_called()
@@ -936,6 +943,8 @@ class ResumableQueueTests(unittest.TestCase):
         self.now = 1793589000.0
         self.clock = patch('capture.time.time', side_effect=lambda: self.now); self.clock.start()
         self.sleep = patch('capture.time.sleep', side_effect=self.advance); self.sleep.start()
+        seed_test_state()
+        seed_test_state('.capture-state/pending.json')
         self.c = Client(); self.r = Runner(self.c, 'state.json', budget=10000)
         self.urls = [BASE + '/pages/test-' + str(i) for i in range(7)]
     def tearDown(self):
@@ -1088,7 +1097,7 @@ class ResumableQueueTests(unittest.TestCase):
         before = source.read_bytes()
         for name in ('saved-state.json', 'operational-report.json'):
             with patch('sys.argv', ['capture.py', '--inspect-state', '--state', name]), patch('capture.Client') as client:
-                self.assertEqual(main(), 0)
+                self.assertEqual(main(), 2 if Path(name).is_symlink() else 0)
                 client.assert_not_called()
             self.assertEqual(source.read_bytes(), before)
         output.unlink()
@@ -1148,7 +1157,8 @@ class ResumableQueueTests(unittest.TestCase):
         self.r.state['_queues'] = {key: {'urls': self.urls, 'cursor': 4, 'results': [], 'complete': False}}
         self.r.process = Mock(side_effect=self.operation)
         self.r.run_queue(self.urls, 'all')
-        self.assertNotIn(key, self.r.state['_queues'])
+        self.assertIn(key, self.r.state['_queues'])
+        self.assertEqual(self.r.state['_queues'][key]['cursor'], 4)
         self.assertEqual(self.r.process.call_count, len(self.urls))
 
     def test_fixed_probe_scope(self):
@@ -1164,6 +1174,8 @@ class GlobalArchivePacingTests(unittest.TestCase):
         self.now = 1793600000.0; self.calls = []
         self.clock = patch('capture.time.time', side_effect=lambda: self.now); self.clock.start()
         self.sleep = patch('capture.time.sleep', side_effect=self.advance); self.sleep.start()
+        seed_test_state()
+        seed_test_state('.capture-state/pending.json')
         self.c = Client(); self.r = Runner(self.c, 'state.json', budget=10000)
         self.c._request = Mock(side_effect=self.response)
     def tearDown(self):
@@ -1276,7 +1288,9 @@ class GlobalArchivePacingTests(unittest.TestCase):
         self.c.verify=Mock(return_value=None)
         for i in range(11):self.r.state[BASE+'/old-'+str(i)]={'job_id':None,'submitted_at':self.now-1000}
         before=json.loads(json.dumps(self.r.state))
-        for url in before:self.r.process(url)
+        for url in before:
+            if url.startswith(BASE + '/'):
+                self.r.process(url)
         for url in before:self.assertEqual(self.r.state[url],before[url])
         self.c._request.assert_not_called()
     def test_safe_first_post_budget_prevents_retry_and_retains_proof(self):
@@ -1397,7 +1411,7 @@ class GlobalArchivePacingTests(unittest.TestCase):
 
     def test_account_diagnostic_one_authenticated_get_preserves_jobs_and_queues(self):
         self.r.state[URL]={'job_id':'saved-job','submitted_at':self.now-900,'review_required':True}
-        self.r.state['_queues']={'all:20261102:capture':{'cursor':5,'complete':False}}
+        self.r.state['_queues']={'all:20261102:capture':{'urls':[URL]*5,'cursor':5,'results':[],'complete':False}}
         before=json.loads(json.dumps(self.r.state))
         self.c._request.side_effect=None
         self.c._request.return_value=(200,{'Age':'15','Date':'Mon, 02 Nov 2026 15:00:00 GMT'},
@@ -1501,11 +1515,11 @@ class GlobalArchivePacingTests(unittest.TestCase):
         from capture import SUPPLEMENTAL_PROBE
         self.r.recover_transport=Mock(return_value=True)
         self.c.verify=Mock(return_value={'timestamp':timestamp(self.now-60),'replay':'verified'})
-        queues={'all:20261101:capture':{'cursor':5,'complete':False},
-                'pacing_probe:20261102:capture':{'cursor':1,'complete':True}}
+        queues={'all:20261101:capture':{'urls':[URL]*5,'cursor':5,'results':[],'complete':False},
+                'pacing_probe:20261102:capture':{'urls':[URL],'cursor':1,'results':[],'complete':True}}
         self.r.state['_queues']=json.loads(json.dumps(queues))
         self.assertEqual(self.r.run_supplemental_probe()['state'],'verified')
-        self.c.verify.assert_called_once_with(SUPPLEMENTAL_PROBE,self.r.since)
+        self.c.verify.assert_called_once_with(SUPPLEMENTAL_PROBE,self.r.since,until=self.r.until)
         self.c._request.assert_not_called()
         for key in queues:self.assertEqual(self.r.state['_queues'][key],queues[key])
         own=[q for key,q in self.r.state['_queues'].items() if key.startswith('supplemental_probe:')]
@@ -1562,6 +1576,8 @@ class OutlinkBatchTests(unittest.TestCase):
         self.inventory,self.digest=load_outlink_inventory();self.root=OUTLINK_PROBE
         self.product=self.inventory['product_urls'][0];self.second=self.inventory['product_urls'][1]
         self.tmp=tempfile.TemporaryDirectory();self.old=os.getcwd();os.chdir(self.tmp.name)
+        seed_test_state()
+        seed_test_state('.capture-state/pending.json')
         self.c=Mock(spec=Client);self.c.post_attempt_callback=None;self.c.verify.return_value=None
         self.r=Runner(self.c,'state.json',budget=1800);self.r.recover_transport=Mock(return_value=True)
         self.post={'job_id':'new-root','status':'pending'}
@@ -1591,11 +1607,11 @@ class OutlinkBatchTests(unittest.TestCase):
     def test_direct_pending_root_and_children_never_overwritten_or_cleared(self):
         urls=[self.root,self.product]+[BASE+'/old-'+str(i) for i in range(19)]
         for u in urls:self.r.state[u]={'job_id':'legacy','submitted_at':time.time()-300,'review_required':True}
-        before=json.loads(json.dumps(self.r.state));self.r.state['_queues']={'all:20261102:capture':{'cursor':5}}
+        before=json.loads(json.dumps(self.r.state));self.r.state['_queues']={'all:20261102:capture':{'urls':[URL]*5,'cursor':5,'results':[],'complete':False}}
         self.c.verify.return_value=self.evidence()
         row=self.r.run_outlink_probe()
         for u in urls:self.assertEqual(self.r.state[u],before[u])
-        self.assertEqual(self.r.state['_queues'],{'all:20261102:capture':{'cursor':5}})
+        self.assertEqual(self.r.state['_queues'],{'all:20261102:capture':{'urls':[URL]*5,'cursor':5,'results':[],'complete':False}})
         self.assertTrue(self.batch()['direct_pending_reference'])
         self.assertTrue(next(iter(self.batch()['children'].values()))['direct_pending_reference'])
         self.assertNotIn('job_id',row) # Do not mislabel legacy direct ID as new batch job.
@@ -1626,6 +1642,7 @@ class OutlinkBatchTests(unittest.TestCase):
         self.c.json.assert_not_called()
     def test_unknown_expansion_allows_existing_job_read_only_reconciliation(self):
         self.r.state['_outlink_batches'] = {self.root: {
+            'root_url':self.root, 'children':{}, 'child_order':[], 'verification_cursor':0, 'utc_day':self.r.since,
             'post_state': 'outcome_unknown', 'expansion_state': 'unknown'}}
         self.r.state[self.second] = {'job_id': 'saved-child', 'submitted_at': time.time()-300}
         self.c.json.return_value = (404, {}, {})
@@ -1639,6 +1656,7 @@ class OutlinkBatchTests(unittest.TestCase):
 
     def test_unknown_expansion_verify_only_does_not_report_submission_hold(self):
         self.r.state['_outlink_batches'] = {self.root: {
+            'root_url':self.root, 'children':{}, 'child_order':[], 'verification_cursor':0, 'utc_day':self.r.since,
             'post_state': 'outcome_unknown', 'expansion_state': 'unknown'}}
         self.r.verify_only = True
         self.assertEqual(self.r.process(self.second)['state'], 'unverified')
@@ -1706,8 +1724,10 @@ class OutlinkBatchTests(unittest.TestCase):
         self.assertEqual(len(self.inventory['product_urls']),154)
         self.assertNotIn(BASE+'/pages/about-us',self.inventory['root_urls'])
         self.assertNotIn(BASE+'/policies/legal-notice',self.inventory['root_urls'])
-    def test_success_shaped_http_error_never_releases_expansion_hold(self):
+    def test_success_shaped_http_error_never_promotes_unknown_expansion(self):
+        self.status['status']='pending'
         self.r.run_outlink_probe()
+        self.status['status']='success'
         batch=self.batch()
         self.r.record_outlink_response(batch,503,{},self.status,{self.product},'root_status')
         self.assertEqual(batch['expansion_state'],'unknown')
@@ -1885,4 +1905,9 @@ class PauseMetadataTests(unittest.TestCase):
                         or bool(re.search(r'http status\s*[=:]\s*429', detail)))
             self.assertEqual(bool(response_metadata(200, {}, obj)['pause_triggers']), expected)
 
+# Keep additional regressions discoverable through the unchanged production CI command.
+from test_verification_candidate import CDXSchemaCandidateTests, CanonicalParserCandidateTests
+from test_legacy_state import LegacyStateTests
+
 if __name__ == '__main__': unittest.main()
+

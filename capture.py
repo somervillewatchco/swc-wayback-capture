@@ -16,6 +16,7 @@ import urllib.error
 import urllib.parse as up
 import urllib.request as ur
 import xml.etree.ElementTree as ET
+import math
 
 BASE = 'https://somervillewatchco.com'
 PRIORITY = ['/', '/policies/refund-policy', '/policies/shipping-policy',
@@ -257,7 +258,7 @@ def operational_summary(state):
         rows = rows if isinstance(rows, list) else []
         for row in rows:
             label = row.get('state') if isinstance(row, dict) else 'unknown'
-            if label not in ('verified', 'unverified', 'deferred', 'pending', 'failed', 'review_required', 'reused', 'unsupported-document-type', 'discovery-incomplete', 'no-additional-targets'):
+            if label not in ('verified', 'unverified', 'deferred', 'pending', 'failed', 'review_required', 'reused', 'unsupported-document-type', 'discovery-incomplete', 'no-additional-targets', 'outlink-held', 'state-held'):
                 label = 'unknown'
             counts[label] = counts.get(label, 0) + 1
         queues.append({'key': key, 'total': total, 'cursor': cursor,
@@ -269,7 +270,21 @@ def operational_summary(state):
     pending = [v for k, v in state.items() if isinstance(k, str) and k.startswith(BASE + '/') and isinstance(v, dict)]
     events = state.get('_recovery_events', [])
     events = events if isinstance(events, list) else []
+    journals = state.get('_outlink_batches', {})
+    journals = journals if isinstance(journals, dict) else {}
+    journal_manifests = []
+    for batch in journals.values():
+        if not isinstance(batch, dict):
+            continue
+        children = batch.get('children', {})
+        children = children if isinstance(children, dict) else {}
+        journal_manifests.append({'sha256': hashlib.sha256(json.dumps(batch, sort_keys=True).encode()).hexdigest(),
+            'children': len(children),
+            'mapped_children': sum(bool(c.get('job_ids')) for c in children.values() if isinstance(c, dict)),
+            'verified_children': sum(c.get('coverage') == 'verified' for c in children.values() if isinstance(c, dict)),
+            'mapping_reported': batch.get('expansion_state') == 'mapping_reported'})
     return {'checked_at': timestamp(time.time()), 'queues': queues,
+            'outlink_journals': {'total': len(journals), 'manifests': journal_manifests},
             'pending_counts': {'total': len(pending),
                                'with_job_id': sum(bool(p.get('job_id')) for p in pending),
                                'review_required': sum(p.get('review_required') is True for p in pending),
@@ -343,6 +358,7 @@ class Client:
         self.archive_next_request_at = 0
         self.archive_deadline = float('inf')
         self.archive_pacing_callback = None
+        self.post_utc_day_end = float('inf')
 
     def paced_request(self, url, data=None, authenticated=False, attempt=1):
         is_archive = up.urlsplit(url).hostname in ('web.archive.org', 'archive.org')
@@ -360,9 +376,16 @@ class Client:
             self.archive_next_request_at = time.time() + self.archive_interval
             if self.archive_pacing_callback:
                 self.archive_pacing_callback(self.archive_next_request_at)
+        # Recheck after every pacing wait and safe retry, before physical POST.
+        if data is not None and time.time() >= self.post_utc_day_end:
+            raise RequestDeferred('Intended UTC day ended; no new submission')
         # Timestamp/audit must follow pacing and precede actual network IO.
         if data is not None and self.post_attempt_callback is not None:
             self.post_attempt_callback({'attempt': attempt, 'started_at': time.time()})
+        # Persistence callbacks can take time: never cross midnight while
+        # journaling and then physically dispatch an obsolete-day POST.
+        if data is not None and time.time() >= self.post_utc_day_end:
+            raise RequestDeferred('Intended UTC day ended during attempt persistence; no submission')
         response = None
         self.archive_observed_retry_after = 0
         try:
@@ -481,8 +504,9 @@ class Client:
         return status, {k.lower(): v for k, v in headers.items()}, obj
 
     def verify(self, url, since, until=None):
+        upper = min(until, time.time() + 60) if until is not None else time.time() + 60
         query = up.urlencode({'url': url, 'matchType': 'exact', 'from': timestamp(since),
-            'to': timestamp(min(until, time.time() + 60) if until is not None else time.time() + 60), 'output': 'json',
+            'to': timestamp(upper), 'output': 'json',
             'fl': 'timestamp,original,statuscode,mimetype,digest'})
         status, _, data = self.json('https://web.archive.org/cdx/search/cdx?' + query)
         if status != 200 or not isinstance(data, list):
@@ -490,20 +514,46 @@ class Client:
         if not data:
             return None
         fields = data[0]
-        if not isinstance(fields, list) or not {'timestamp', 'original', 'statuscode', 'mimetype'}.issubset(fields):
+        expected = {'timestamp', 'original', 'statuscode', 'mimetype', 'digest'}
+        if (not isinstance(fields, list) or len(fields) != len(expected)
+            or any(not isinstance(field, str) for field in fields)
+            or set(fields) != expected):
             raise LookupFailure('Invalid CDX schema')
-        for values in reversed(data[1:]):
-            if len(values) != len(fields):
+        rows = []
+        # Validate the entire response before replaying any row. Malformed
+        # evidence is a lookup failure, never absence or partial success.
+        for values in data[1:]:
+            if not isinstance(values, list) or len(values) != len(fields):
                 raise LookupFailure('Incomplete CDX row')
+            if any(not isinstance(value, str) or not value
+                   or re.search(r'[\x00-\x1f\x7f]', value) for value in values):
+                raise LookupFailure('Invalid CDX field')
             row = dict(zip(fields, values))
+            if not re.fullmatch(r'[0-9]{14}', row['timestamp']):
+                raise LookupFailure('Invalid CDX timestamp')
+            try:
+                captured = epoch(row['timestamp'])
+                if timestamp(captured) != row['timestamp']:
+                    raise ValueError('Noncanonical timestamp')
+                original = up.urlsplit(row['original'])
+                if (original.scheme not in ('http', 'https') or not original.hostname
+                    or original.username is not None or original.password is not None
+                    or original.port not in (None, 80 if original.scheme == 'http' else 443)
+                    or re.search(r'\s', row['original'])):
+                    raise ValueError('Invalid original URL')
+            except (ValueError, OverflowError, OSError):
+                raise LookupFailure('Invalid CDX timestamp or original URL') from None
+            if not re.fullmatch(r'(?:[1-5][0-9]{2}|-)', row['statuscode']):
+                raise LookupFailure('Invalid CDX status code')
+            if not re.fullmatch(r"(?:[A-Za-z0-9!#$&^_.+\-]+/[A-Za-z0-9!#$&^_.+\-]+|-)", row['mimetype']):
+                raise LookupFailure('Invalid CDX MIME type')
+            rows.append((row, captured))
+        for row, captured in reversed(rows):
             if row['statuscode'] != '200' or row['mimetype'] not in ('text/html', 'application/xhtml+xml', 'warc/revisit'):
                 continue
             if identity(row['original']) != identity(url) or not identity(url):
                 continue
-            try:
-                if not since <= epoch(row['timestamp']) <= (min(until, time.time() + 60) if until is not None else time.time() + 60):
-                    continue
-            except ValueError:
+            if not since <= captured <= upper:
                 continue
             replay = 'https://web.archive.org/web/' + row['timestamp'] + 'id_/' + row['original']
             code, headers, body, final = self.request(replay)
@@ -570,6 +620,63 @@ def has_challenge_heading(body):
     return any(re.fullmatch(prompt, heading, re.I) for heading in parser.headings)
 
 
+class CanonicalLinks(HTMLParser):
+    """Read active canonical links using HTML attribute and entity semantics."""
+    IGNORED = frozenset(('script', 'style', 'template'))
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.ignored = []
+        self.links = []
+        self.base = None
+        self.invalid = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.IGNORED:
+            self.ignored.append(tag)
+        if self.ignored:
+            return
+        if tag == 'base' and self.base is None:
+            bases = [value for name, value in attrs if name == 'href']
+            if bases:
+                self.base = bases[0] or ''
+                self.invalid |= len(bases) != 1
+        if tag != 'link':
+            return
+        rels = [value for name, value in attrs if name == 'rel']
+        if not any('canonical' in (value or '').lower().split() for value in rels):
+            return
+        hrefs = [value for name, value in attrs if name == 'href']
+        if len(rels) != 1 or len(hrefs) != 1 or not hrefs[0] or not hrefs[0].strip():
+            self.invalid = True
+        else:
+            self.links.append(hrefs[0].strip())
+
+    def handle_endtag(self, tag):
+        if self.ignored and tag == self.ignored[-1]:
+            self.ignored.pop()
+
+
+def canonical_links_match(body, url):
+    parser = CanonicalLinks()
+    try:
+        parser.feed(body)
+        parser.close()
+        if parser.invalid:
+            return False
+        base = up.urljoin(url, parser.base) if parser.base is not None else url
+        for href in parser.links:
+            target = up.urljoin(base, href)
+            parsed = up.urlsplit(target)
+            if (parsed.username is not None or parsed.password is not None
+                or parsed.port not in (None, 80 if parsed.scheme == 'http' else 443)
+                or identity(target) != identity(url) or identity(url) is None):
+                return False
+    except ValueError:
+        return False
+    return True
+
+
 def usable_html(body, url):
     title = re.search(r'<title[^>]*>(.*?)</title>', body, re.I | re.S)
     if len(body) < 512 or not title or not html.unescape(title[1]).strip():
@@ -580,10 +687,8 @@ def usable_html(body, url):
     # This is a rejection heuristic, not proof that remaining content is valid.
     if has_challenge_heading(body):
         return False
-    for tag in re.findall(r'<link\b[^>]*>', body, re.I):
-        attrs = dict((k.lower(), html.unescape(v)) for k, _, v in re.findall(r'([\w-]+)\s*=\s*([\'"])(.*?)\2', tag, re.S))
-        if attrs.get('rel', '').lower() == 'canonical' and identity(up.urljoin(url, attrs.get('href', ''))) != identity(url):
-            return False
+    if not canonical_links_match(body, url):
+        return False
     # Controlled cart must actually contain the expected variant, not merely a $0 cart shell.
     if '/cart/51183558787357:1' in url:
         return bool(re.search(r'name=[\'"]id[\'"][^>]*value=[\'"]51183558787357', body))
@@ -683,12 +788,125 @@ def discover_supplemental(client):
     baseline.update(identity(url) for url in discover(client))
     return [url for url in discover_sitemap(client) if identity(url) not in baseline]
 
+class StateContinuityError(RuntimeError):
+    """No requests or state replacement are safe until reviewed recovery."""
+
+
+def _reject(message):
+    raise StateContinuityError(message)
+
+
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value < 1e15
+
+
+def decode(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                _reject('Duplicate state JSON key; preserve bytes for review')
+            result[key] = value
+        return result
+    try:
+        return json.loads(raw, object_pairs_hook=pairs,
+            parse_constant=lambda _: _reject('Non-finite state JSON value'))
+    except (ValueError, UnicodeError):
+        _reject('Unreadable state JSON; preserve bytes for review')
+
+
+def validate_state(state):
+    if not isinstance(state, dict):
+        _reject('State must be a JSON object')
+    if not state:
+        _reject('Empty state requires reviewed recovery; no initialization permitted')
+    metadata = {'_queues', '_completed_jobs', '_outlink_batches', '_next_submit',
+                '_transport_cooldown_until', '_archive_next_request_at',
+                '_recovery_events', '_account_diagnostic'}
+    for key, value in state.items():
+        if key in ('_next_submit', '_transport_cooldown_until', '_archive_next_request_at'):
+            if not _number(value):
+                _reject('Invalid persisted cooldown')
+        elif key == '_queues':
+            if not isinstance(value, dict):
+                _reject('Invalid queue map')
+            for qkey, queue in value.items():
+                if not isinstance(qkey, str) or not isinstance(queue, dict):
+                    _reject('Invalid queue entry')
+                urls, cursor = queue.get('urls'), queue.get('cursor')
+                if (not isinstance(urls, list) or any(not isinstance(u, str) or not u.startswith(BASE + '/') for u in urls)
+                        or not isinstance(cursor, int) or isinstance(cursor, bool) or not 0 <= cursor <= len(urls)
+                        or not isinstance(queue.get('results'), list) or any(not isinstance(r, dict) for r in queue['results'])
+                        or not isinstance(queue.get('complete'), bool)):
+                    _reject('Invalid queue checkpoint')
+                if queue.get('started') is not None and (cursor >= len(urls) or queue['started'] != urls[cursor]):
+                    _reject('Inconsistent interrupted queue operation')
+        elif key == '_outlink_batches':
+            if not isinstance(value, dict):
+                _reject('Invalid outlink journal map')
+            for root, batch in value.items():
+                if (not isinstance(root, str) or not isinstance(batch, dict)
+                        or batch.get('root_url') != root or not isinstance(batch.get('children'), dict)
+                        or not isinstance(batch.get('child_order'), list)):
+                    _reject('Invalid outlink journal')
+                if batch.get('post_state') not in ('not_dispatched', 'not_dispatched_budget', 'not_sent_proven',
+                        'dispatch_started', 'response_received', 'outcome_unknown'):
+                    _reject('Invalid or missing outlink dispatch state')
+                if batch.get('expansion_state') not in ('unknown', 'mapping_reported'):
+                    _reject('Invalid or missing outlink mapping confidence')
+                children, order = batch['children'], batch['child_order']
+                if (any(not isinstance(c, dict) or not isinstance(c.get('job_ids'), list)
+                        or any(not isinstance(j, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', j) for j in c['job_ids']) for c in children.values())
+                        or any(not isinstance(k, str) or k not in children for k in order)):
+                    _reject('Invalid outlink child mapping')
+                if 'server_paused_until' in batch and not _number(batch['server_paused_until']):
+                    _reject('Invalid outlink cooldown')
+                cursor = batch.get('verification_cursor')
+                if (not isinstance(cursor, int) or isinstance(cursor, bool) or not 0 <= cursor <= len(order)
+                        or not _number(batch.get('utc_day'))):
+                    _reject('Invalid outlink verification checkpoint')
+        elif key in ('_completed_jobs', '_recovery_events'):
+            if not isinstance(value, list) or any(not isinstance(v, dict) for v in value):
+                _reject('Invalid retained history')
+        elif key == '_account_diagnostic':
+            if not isinstance(value, dict):
+                _reject('Invalid account observation')
+        elif key.startswith(BASE + '/'):
+            if not isinstance(value, dict) or not value:
+                _reject('Invalid pending job record')
+            job = value.get('job_id')
+            if job is not None and (not isinstance(job, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', job)):
+                _reject('Invalid retained job ID')
+            for name in ('submitted_at', 'retry_eligible_at', 'server_retry_after_until', 'status_paused_until', 'retry_not_before', 'next_status_at'):
+                if name in value and not _number(value[name]):
+                    _reject('Invalid pending job time')
+            for name in ('request_evidence', 'status_evidence', 'terminal_reused'):
+                if name in value and not isinstance(value[name], dict):
+                    _reject('Invalid pending job evidence')
+        elif key not in metadata:
+            _reject('Unexpected state key; preserve for review')
+    return state
+
+
+def load_legacy_state(path, with_digest=False):
+    """Validate shape only: legacy JSON does not establish historical continuity."""
+    if path.is_symlink():
+        _reject('State symlink requires reviewed recovery')
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        _reject('Missing/unreadable state; no initialization permitted')
+    state = validate_state(decode(raw))
+    return (state, hashlib.sha256(raw).hexdigest()) if with_digest else state
+
+
 class Runner:
     def __init__(self, client, state_path, budget=17400, interval=60, verify_only=False, poll_only=False):
         self.client, self.state_path = client, Path(state_path)
-        self.state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {}
+        self.state, self._state_digest = load_legacy_state(self.state_path, with_digest=True)
         self.started = time.time()
-        self.since = dt.datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        self.since = dt.datetime.fromtimestamp(self.started, UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        self.until = self.since + 86400 - 1
         self.deadline, self.interval = self.started + budget, interval
         self.verify_only = verify_only
         self.poll_only = poll_only
@@ -697,6 +915,7 @@ class Runner:
         self.transport_failure_streak = 0
         self.transport_circuit_open = False
         self.client.post_retry_deadline = self.deadline
+        self.client.post_utc_day_end = self.since + 86400
         self.client.archive_interval = 120
         self.client.archive_next_request_at = max(self.state.get('_archive_next_request_at', 0),
                                                  self.state.get('_transport_cooldown_until', 0), self.state.get('_next_submit', 0))
@@ -707,17 +926,30 @@ class Runner:
         self.client.archive_pacing_callback = persist_archive_gate
 
     def save(self):
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        validate_state(self.state)
+        if not self.state_path.is_file() or self.state_path.is_symlink():
+            _reject('State disappeared or changed type; no initialization permitted')
+        try:
+            existing = self.state_path.read_bytes()
+        except OSError:
+            _reject('State became unreadable; preserve for reviewed recovery')
+        if hashlib.sha256(existing).hexdigest() != self._state_digest:
+            _reject('State changed since load; refusing to overwrite unknown history')
+        raw = json.dumps(self.state, indent=2, allow_nan=False).encode()
         tmp = self.state_path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(self.state, indent=2))
+        tmp.write_bytes(raw)
         tmp.replace(self.state_path)
+        self._state_digest = hashlib.sha256(raw).hexdigest()
         self.write_operational_report()
 
     def write_operational_report(self):
         output = Path('operational-report.json')
         if (output.resolve() != self.state_path.resolve()
                 and not (output.exists() and self.state_path.exists() and output.samefile(self.state_path))):
-            output.write_text(json.dumps(operational_summary(self.state), indent=2))
+            summary = operational_summary(self.state)
+            summary['state_continuity'] = {'mode': 'legacy-shape-validation-only',
+                'historical_completeness': 'not-established'}
+            output.write_text(json.dumps(summary, indent=2))
 
     def recovery_event(self, phase, cycle, **details):
         event = safe_recovery_event({'checked_at': timestamp(time.time()), 'cycle': cycle, 'phase': phase, **details})
@@ -737,7 +969,7 @@ class Runner:
             row['job_id'] = job_id
         if isinstance(pending.get('submitted_at'), (int, float)):
             row['submitted_at'] = pending['submitted_at']
-        for key in ('status_evidence', 'request_evidence', 'terminal_reused', 'retry_eligible_at', 'review_required', 'submission_response', 'status_response', 'transport_failure', 'known_not_sent', 'status_error', 'server_retry_after_until', 'status_paused_until', 'job_diagnostic'):
+        for key in ('status_evidence', 'request_evidence', 'terminal_reused', 'retry_eligible_at', 'review_required', 'submission_response', 'status_response', 'transport_failure', 'known_not_sent', 'status_error', 'server_retry_after_until', 'status_paused_until', 'next_status_at', 'job_diagnostic'):
             if key in pending:
                 row[key] = pending[key]
         return row
@@ -754,7 +986,7 @@ class Runner:
         completed = self.state.setdefault('_completed_jobs', [])
         completed.append({'url': url, 'state': state, **details,
                           **self.diagnostic_snapshot(url), 'completed_at': timestamp(time.time())})
-        self.state['_completed_jobs'] = completed[-50:]
+        self.state['_completed_jobs'] = completed  # Append-only; never erase uncertain history.
         self.state.pop(url, None)
         self.save()
 
@@ -815,7 +1047,7 @@ class Runner:
         if captured_at > time.time() + 60:
             return None
         if check_daily:
-            evidence = self.client.verify(url, self.since)
+            evidence = self.client.verify(url, self.since, until=self.until)
             if evidence:
                 return self.verified_result(url, evidence, 'job_reconciled_index')
         if captured_at >= self.since:
@@ -872,7 +1104,7 @@ class Runner:
         self.recovery_event('waiting', cycle, cooldown_until=until)
         time.sleep(max(0, until - time.time()))
         query = up.urlencode({'url': BASE + '/pages/warranty-policy',
-            'matchType': 'exact', 'from': timestamp(self.since), 'output': 'json',
+            'matchType': 'exact', 'from': timestamp(self.since), 'to': timestamp(self.until), 'output': 'json',
             'fl': 'timestamp,original,statuscode,mimetype'})
         endpoints = [('https://web.archive.org/save/status/system', dict),
                      ('https://web.archive.org/cdx/search/cdx?' + query, list)]
@@ -927,11 +1159,7 @@ class Runner:
         mode = 'verify' if self.verify_only else 'poll' if self.poll_only else 'capture'
         key = scope + ':' + timestamp(self.since)[:8] + ':' + mode
         queues = self.state.setdefault('_queues', {})
-        # Yesterday's cursors must not suppress today's daily capture goal.
-        for old in list(queues):
-            if ':' + timestamp(self.since)[:8] + ':' not in old:
-                if scope != 'supplemental_probe' or old.startswith('supplemental_probe:'):
-                    del queues[old]
+        # Keep old checkpoints as evidence, without changing the daily scheduler.
         queue = queues.get(key)
         if not queue or queue.get('complete'):
             queue = {'urls': list(dict.fromkeys(urls)), 'cursor': 0,
@@ -991,6 +1219,10 @@ class Runner:
         for batch in journals.values():
             if not isinstance(batch, dict):
                 return 'outlink journal needs review; no direct submission'
+            if (batch.get('post_state') not in ('not_dispatched', 'not_dispatched_budget', 'not_sent_proven',
+                    'dispatch_started', 'response_received', 'outcome_unknown')
+                    or batch.get('expansion_state') not in ('unknown', 'mapping_reported')):
+                return 'outlink dispatch/mapping state needs review; no direct submission'
             sent = batch.get('post_state') in ('dispatch_started', 'response_received', 'outcome_unknown')
             if sent and batch.get('expansion_state') != 'mapping_reported' and identity(url):
                 return 'outlink expansion unknown; run outlink_probe --verify-only, then obtain reviewed resolution if still unknown'
@@ -1008,7 +1240,8 @@ class Runner:
         detail = response_metadata(code, headers, obj if isinstance(obj, dict) else {})
         detail.update(phase=phase, checked_at=timestamp(time.time()), schema_valid=isinstance(obj, dict))
         batch['responses'] = (batch.get('responses', []) + [detail])[-12:]
-        batch['expansion_state'] = 'unknown'
+        # Mapping knowledge is independent of later status/verification errors.
+        batch.setdefault('expansion_state', 'unknown')
         if isinstance(obj, dict):
             job = obj.get('job_id')
             if isinstance(job, str) and re.fullmatch(r'[A-Za-z0-9_-]+', job):
@@ -1047,7 +1280,6 @@ class Runner:
             batch['root_reported_status'] = obj.get('status') if obj.get('status') in ('success', 'pending', 'error') else 'unknown'
         self.save()
         if self.pause(headers, {**(obj if isinstance(obj, dict) else {}), '_http': code}):
-            batch['expansion_state'] = 'unknown'
             batch['server_paused_until'] = self.next_submit
             if (phase == 'root_status' and code == 200 and detail.get('status') == 'error'
                     and detail.get('root_job_id_matches') is True):
@@ -1097,12 +1329,14 @@ class Runner:
                 or not 0 < batch['utc_day'] <= time.time() + 86400):
             return self.result(root, 'review_required', reason='outlink journal/inventory mismatch; no request made')
         if not exists:
+            if time.time() >= self.since + 86400:
+                return self.result(root, 'deferred', reason='intended UTC day ended; no new outlink submission')
             if self.verify_only or self.poll_only:
                 return self.result(root, 'outlinks-partial', reason='no saved outlink batch; read-only mode never submits')
             if not self.recover_transport(cycle=1):
                 return self.result(root, 'deferred', reason='mandatory paced health gate failed; no outlink submission')
             try:
-                before = self.client.verify(root, self.since)
+                before = self.client.verify(root, self.since, until=self.until)
             except (LookupFailure, ValueError, OSError):
                 return self.result(root, 'deferred', reason='pre-submission archive evidence unavailable; no outlink submission')
             batch = {'root_url': root, 'inventory_sha256': digest,
@@ -1187,7 +1421,6 @@ class Runner:
                 self.save()
         except (LookupFailure, ValueError, OSError) as exc:
             batch['verification_interrupted'] = type(exc).__name__
-            batch['expansion_state'] = 'unknown'
             self.save()
             return self.outlink_report(batch, inventory, 'partial read-only verification; IDs and cursor retained')
         return self.outlink_report(batch, inventory, 'root and child evidence assessed separately; no completeness inferred from root success')
@@ -1291,7 +1524,7 @@ class Runner:
         if time.time() + 35 >= self.deadline:
             return self.result(url, 'deferred', reason='run time budget', queue_untouched=True)
         try:
-            evidence = self.client.verify(url, self.since)
+            evidence = self.client.verify(url, self.since, until=self.until)
             if evidence:
                 return self.verified_result(url, evidence, 'existing_index')
             pending = self.state.get(url)
@@ -1322,6 +1555,8 @@ class Runner:
             if not pending and self.poll_only:
                 return self.result(url, 'unverified', reason='no saved job to poll; no submission made')
             if not pending:
+                if time.time() >= self.since + 86400:
+                    return self.result(url, 'deferred', reason='intended UTC day ended; no new submission')
                 # An unknown outlink expansion forbids a new POST, but must not
                 # prevent read-only reconciliation of an already saved job.
                 hold = self.outlink_submission_hold(url)
@@ -1333,6 +1568,8 @@ class Runner:
                 if delay:
                     print('Waiting %ss before next submission' % int(delay), flush=True)
                     time.sleep(delay)
+                if time.time() >= self.since + 86400:
+                    return self.result(url, 'deferred', reason='intended UTC day ended while waiting; no new submission')
                 pending = {'submitted_at': time.time(), 'job_id': None,
                     'request_evidence': {'method': 'POST', 'endpoint': 'https://web.archive.org/save/',
                                          'if_not_archived_within': '1'}}
@@ -1379,9 +1616,19 @@ class Runner:
                 self.save()
             if not pending.get('job_id'):
                 return self.result(url, 'pending', reason='earlier submission outcome unknown; needs review')
-            for _ in range(12):
+            due = max(pending.get('next_status_at', 0), pending.get('status_paused_until', 0),
+                      pending.get('server_retry_after_until', 0))
+            if time.time() < due:
+                return self.result(url, 'pending', reason='saved status observation not yet due; job retained')
+            # One observation per URL/pass. Persist reservation BEFORE I/O so
+            # restart/interruption cannot reset the polling cadence.
+            for _ in range(1):
                 if time.time() + 40 >= self.deadline:
                     break
+                pending['next_status_at'] = max(time.time(), due,
+                    self.next_submit, self.state.get('_archive_next_request_at', 0),
+                    self.state.get('_transport_cooldown_until', 0)) + 900
+                self.save()
                 status, headers, obj = self.client.json('https://web.archive.org/save/status/' + pending['job_id'], authenticated=True)
                 if not isinstance(obj, dict):
                     raise LookupFailure('Invalid status response')
@@ -1390,6 +1637,9 @@ class Runner:
                 if pending['status_response'].get('retry_after_until'):
                     pending['server_retry_after_until'] = max(pending.get('server_retry_after_until', 0),
                         pending['status_response']['retry_after_until'])
+                pending['next_status_at'] = max(pending['next_status_at'], time.time() + 900,
+                    pending.get('server_retry_after_until', 0),
+                    self.state.get('_archive_next_request_at', 0))
                 self.save()
                 if self.pause(headers, obj):
                     # Throttling the status lookup does not prove the accepted
@@ -1443,11 +1693,10 @@ class Runner:
                     pending['status_error'] = True
                     pending['review_required'] = True
                     self.save()
-                    evidence = self.client.verify(url, self.since)
+                    evidence = self.client.verify(url, self.since, until=self.until)
                     if evidence:
                         return self.verified_result(url, evidence, 'status_error_reconciled_index')
                     return self.result(url, 'review_required', reason='job reported error; no usable indexed capture yet, no automatic resubmission')
-                time.sleep(10)
             return self.result(url, 'pending', reason='job or independent index verification pending')
         except RequestDeferred:
             pending = self.state.get(url, {})
@@ -1485,7 +1734,11 @@ def main():
     args = parser.parse_args()
     if args.inspect_state:
         path = Path(args.state)
-        state = json.loads(path.read_text()) if path.exists() else {}
+        try:
+            state = load_legacy_state(path)
+        except StateContinuityError as exc:
+            print(json.dumps({'state': 'state-held', 'reason': str(exc), 'network_requests': 0}), flush=True)
+            return 2
         summary = operational_summary(state)
         output = Path('operational-report.json')
         if (output.resolve() != path.resolve()
@@ -1495,7 +1748,11 @@ def main():
         return 0
     client = Client()
     budget = min(args.budget, 1800) if args.scope in ('pacing_probe', 'pacing_job_diagnostic', 'account_diagnostic', 'supplemental_probe', 'outlink_probe') else args.budget
-    runner = Runner(client, args.state, budget, verify_only=args.verify_only, poll_only=args.poll_only)
+    try:
+        runner = Runner(client, args.state, budget, verify_only=args.verify_only, poll_only=args.poll_only)
+    except StateContinuityError as exc:
+        print(json.dumps({'state': 'state-held', 'reason': str(exc), 'network_requests': 0}), flush=True)
+        return 2
     if args.scope == 'outlink_probe':
         row = runner.run_outlink_probe(args.outlink_page)
         print('Outlink expansion and child coverage are separate; partial is not complete.')
@@ -1538,3 +1795,4 @@ def main():
 
 if __name__ == '__main__':
     raise SystemExit(main())
+
