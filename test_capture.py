@@ -141,6 +141,176 @@ class VerificationTests(unittest.TestCase):
         self.assertNotEqual(identity(BASE+'/collections/all?page=2'), identity(BASE+'/collections/all'))
         self.assertIsNone(identity('https://evil.example/'))
 
+class SharedIndexVerificationTests(unittest.TestCase):
+    """Read-only proposal component, with real parsing/pacing and fake IO."""
+    def setUp(self):
+        from capture import epoch
+        self.now = epoch('20261104120000')
+        self.since = epoch('20261104000000')
+        self.ts = timestamp(self.now - 60)
+        self.calls = []
+        self.rows = []
+        self.status = 200
+        self.body_override = None
+        self.redirect = False
+        self.clock = patch('capture.time.time', side_effect=lambda: self.now)
+        self.clock.start(); self.addCleanup(self.clock.stop)
+        self.sleep = patch('capture.time.sleep', side_effect=self.advance)
+        self.sleep.start(); self.addCleanup(self.sleep.stop)
+        self.client = Client()
+        self.client.archive_interval = 120
+        self.client._request = Mock(side_effect=self.request)
+
+    def advance(self, seconds):
+        self.assertGreaterEqual(seconds, 0)
+        self.now += seconds
+
+    def row(self, url=URL, ts=None):
+        return [ts or self.ts, url, '200', 'text/html', 'digest']
+
+    def request(self, url, data=None, authenticated=False):
+        self.calls.append((url, data, authenticated, self.now))
+        self.assertIsNone(data)
+        self.assertFalse(authenticated)
+        if '/cdx/' in url:
+            return self.status, {}, json.dumps(self.rows), url
+        original = url.split('id_/', 1)[1]
+        body = GOOD
+        if '/products/' in original:
+            name = original.rsplit('/', 1)[-1].replace('-', ' ').title()
+            node = {'@type': 'Product', 'url': original, '@id': original + '#product',
+                    'name': name, 'offers': {'price': '339.99', 'priceCurrency': 'USD'}}
+            body = ('<html><title>' + name + ' – Somerville Watch Co.</title>'
+                    '<script type="application/ld+json">' + json.dumps(node) + '</script>'
+                    '<body><h1>' + name + '</h1>' + 'Watch details ' * 80 + '</body></html>')
+        return (200, {'content-type': 'text/html'},
+                self.body_override if self.body_override is not None else body,
+                url.replace(self.ts, '20261103000000') if self.redirect else url)
+
+    def test_all_166_targets_use_one_index_and_166_independent_replays(self):
+        from capture import PRIORITY
+        from urllib.parse import parse_qs, urlsplit
+        targets = [BASE + p for p in PRIORITY] + [BASE + '/products/watch-' + str(i) for i in range(154)]
+        self.rows = [FIELDS] + [self.row(url) for url in targets]
+        results = dict(self.client.verify_many(targets, self.since))
+        self.assertEqual(set(results), set(targets))
+        self.assertTrue(all(evidence and evidence['original'] == url for url, evidence in results.items()))
+        self.assertEqual(len(self.calls), 167)
+        queries = [url for url, _, _, _ in self.calls if '/cdx/' in url]
+        self.assertEqual(len(queries), 1)
+        query = parse_qs(urlsplit(queries[0]).query)
+        self.assertEqual(query['matchType'], ['host'])
+        self.assertEqual(query['showResumeKey'], ['true'])
+        self.assertEqual(query['limit'], ['5000'])
+        self.assertEqual(query['from'], ['20261104000000'])
+        self.assertEqual(query['to'], ['20261104120100'])
+        self.assertEqual(self.calls[-1][3] - self.calls[0][3], 166 * 120)
+
+    def test_duplicate_targets_reuse_index_without_duplicate_replays(self):
+        self.rows = [FIELDS, self.row()]
+        self.assertEqual(len(list(self.client.verify_many([URL, URL], self.since))), 1)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_complete_empty_snapshot_returns_no_evidence_without_replay(self):
+        self.assertEqual(list(self.client.verify_many([URL], self.since)), [(URL, None)])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_resumption_marker_rejects_whole_batch_before_any_replay(self):
+        self.rows = [FIELDS, self.row(), [], ['continuation-key']]
+        with self.assertRaises(LookupFailure):
+            next(self.client.verify_many([URL], self.since))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_row_limit_rejects_response_even_without_continuation_marker(self):
+        self.rows = [FIELDS] + [self.row()] * 5000
+        with self.assertRaises(LookupFailure):
+            next(self.client.verify_many([URL], self.since))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_malformed_unrequested_row_invalidates_whole_snapshot(self):
+        self.rows = [FIELDS, self.row(), ['20261104115900', BASE + '/unknown']]
+        with self.assertRaises(LookupFailure):
+            next(self.client.verify_many([URL], self.since))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_wrong_schema_and_http_failure_are_never_absence(self):
+        for status, rows in ((200, [['original'], [URL]]), (503, [])):
+            with self.subTest(status=status):
+                self.status, self.rows = status, rows
+                with self.assertRaises(LookupFailure):
+                    next(self.client.verify_many([URL], self.since))
+        self.assertTrue(all('/cdx/' in call[0] for call in self.calls))
+
+    def test_exact_original_and_day_bounds_reject_aliases_and_wrong_dates(self):
+        self.rows = [FIELDS, self.row(BASE), self.row('http://somervillewatchco.com/'),
+                     self.row('https://www.somervillewatchco.com/'),
+                     self.row(ts='20261103235959'), self.row(ts='20261104140000')]
+        self.assertEqual(list(self.client.verify_many([URL], self.since)), [(URL, None)])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_unrequested_index_urls_are_never_replayed_or_returned(self):
+        self.rows = [FIELDS, self.row(), self.row(BASE + '/unknown?private=value')]
+        result = list(self.client.verify_many([URL], self.since))
+        self.assertEqual(len(result), 1)
+        self.assertIsNotNone(result[0][1])
+        self.assertNotIn('private=value', json.dumps(result))
+        self.assertEqual(len(self.calls), 2)
+
+    def test_each_replay_still_rejects_redirects_and_challenge_pages(self):
+        self.rows = [FIELDS, self.row()]
+        self.redirect = True
+        self.assertEqual(list(self.client.verify_many([URL], self.since)), [(URL, None)])
+        self.redirect = False
+        self.body_override = GOOD.replace('<body>', '<body><h1>Verify you are human</h1>')
+        self.assertEqual(list(self.client.verify_many([URL], self.since)), [(URL, None)])
+
+    def test_product_without_valid_identity_and_price_is_not_coverage(self):
+        product = BASE + '/products/example-watch'
+        self.rows = [FIELDS, self.row(product)]
+        self.body_override = GOOD
+        self.assertEqual(list(self.client.verify_many([product], self.since)), [(product, None)])
+
+    def test_invalid_targets_and_cross_day_windows_do_no_network_work(self):
+        for targets, since, until in ((['https://evil.example/'], self.since, None),
+                                     ([URL + '?private=x'], self.since, None),
+                                     ([URL], self.since + 1, None),
+                                     ([URL], self.since, self.since + 86400),
+                                     ([URL], True, None)):
+            with self.subTest(targets=targets, since=since, until=until):
+                with self.assertRaises(LookupFailure):
+                    list(self.client.verify_many(targets, since, until))
+        self.assertEqual(self.calls, [])
+
+    def test_new_batch_reads_index_again_and_does_not_cache_absence(self):
+        self.assertEqual(list(self.client.verify_many([URL], self.since)), [(URL, None)])
+        self.rows = [FIELDS, self.row()]
+        self.assertIsNotNone(dict(self.client.verify_many([URL], self.since))[URL])
+        self.assertEqual(sum('/cdx/' in call[0] for call in self.calls), 2)
+
+    def test_cooldowns_breaker_and_accepted_jobs_survive_batch_failures(self):
+        from capture import RequestDeferred
+        with tempfile.TemporaryDirectory() as folder:
+            old = os.getcwd()
+            try:
+                os.chdir(folder)
+                seed_test_state('state.json')
+                with patch.dict(os.environ, {'GITHUB_RUN_ID': '12345', 'GITHUB_RUN_ATTEMPT': '1'}):
+                    runner = Runner(self.client, 'state.json', budget=20000)
+                    pending = {'job_id': 'accepted-contact', 'submitted_at': self.now - 60}
+                    runner.state[URL] = dict(pending)
+                    runner.save()
+                    self.status = 429
+                    for _ in range(2):
+                        with self.assertRaises((LookupFailure, RequestDeferred)):
+                            next(self.client.verify_many([URL], self.since))
+                    self.assertTrue(runner.pause_circuit_open)
+                    self.assertEqual(runner.paused_responses, 3)
+                    self.assertEqual(runner.state[URL], pending)
+                    self.assertEqual(len(self.calls), 3)
+                    self.assertTrue(all(b[3] - a[3] >= 1200 for a, b in zip(self.calls, self.calls[1:])))
+            finally:
+                os.chdir(old)
+
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
@@ -1851,6 +2021,29 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('args+=(--poll-only)', workflow)
 
 class PauseMetadataTests(unittest.TestCase):
+    def test_extended_error_field_keeps_safe_cause_without_raw_text(self):
+        from capture import response_metadata
+        detail = response_metadata(200, {}, {'status': 'error', 'status_ext':
+            'SECRET crawling this host is paused; HTTP status=429; overloaded'})
+        self.assertEqual(detail['http_status'], 200)
+        self.assertEqual(detail['status_ext'], 'unknown')
+        self.assertEqual(detail['message_category'], 'host_paused')
+        self.assertEqual(detail['provider_reported_http_statuses'], [429])
+        self.assertEqual(detail['pause_reported_in'], ['status_ext'])
+        self.assertNotIn('SECRET', json.dumps(detail))
+
+    def test_provider_status_conflicts_are_visible_not_silently_selected(self):
+        from capture import response_metadata
+        detail = response_metadata(200, {}, {'status_ext': 'HTTP status=503',
+            'message': 'HTTP status=429; HTTP status=429'})
+        self.assertEqual(detail['provider_reported_http_statuses'], [429, 503])
+        self.assertEqual(detail['pause_reported_in'], ['message'])
+        malformed = response_metadata(200, {}, {'status_ext': ['SECRET HTTP status=429'],
+            'message': {'private': 'SECRET HTTP status=503'}})
+        self.assertNotIn('provider_reported_http_statuses', malformed)
+        self.assertEqual(malformed['pause_reported_in'], [])
+        self.assertNotIn('SECRET', json.dumps(malformed))
+
     def test_each_existing_pause_predicate_has_safe_distinct_observation(self):
         from capture import response_metadata
         cases = [
@@ -2073,6 +2266,113 @@ class DailyPolicyRunnerTests(unittest.TestCase):
             '/policies/terms-of-service', '/policies/privacy-policy', '/policies/contact-information',
             '/policies/legal-notice', '/pages/contact', '/pages/warranty-policy',
             '/pages/no-brand-affiliation', '/policies/subscription-policy', '/cart'])
+
+    def test_verified_products_survive_repeated_same_day_passes_and_new_inventory(self):
+        second = BASE + '/products/second-watch'
+        ts = timestamp(self.now - 60)
+        def verify(runner):
+            runner.process = Mock(side_effect=lambda url: runner.result(
+                url, 'verified', timestamp=ts, original=url, statuscode='200'))
+        verify(self.r)
+        self.r.run_queue([self.product], 'all')
+        self.r.process.assert_called_once_with(self.product)
+        original = json.loads(json.dumps(self.r.state['_queues']['all:20261104:capture:daily-v2']))
+        verify(self.restart())
+        self.r.run_queue([self.product, second], 'all')
+        self.r.process.assert_called_once_with(second)
+        self.assertEqual({r['url'] for r in self.r.results}, {self.product, second})
+        verify(self.restart())
+        self.r.run_queue([self.product, second], 'all')
+        self.r.process.assert_not_called()
+        self.assertEqual({r['url'] for r in self.r.results}, {self.product, second})
+        self.assertIn(original, [q for key, q in self.r.state['_queues'].items() if ':pass:' in key])
+        self.assertEqual(self.calls, [])
+
+    def test_prior_day_and_malformed_evidence_do_not_skip_products(self):
+        second = BASE + '/products/second-watch'
+        key = 'all:20261104:capture:daily-v2'
+        self.r.state['_queues'] = {key: {'urls': [self.product, second], 'cursor': 2,
+            'complete': True, 'results': [
+                {'url': self.product, 'state': 'verified', 'timestamp': '20261103235959'},
+                {'url': second, 'state': 'verified', 'timestamp': '20261104-invalid'}]}}
+        self.r.save()
+        self.r.process = Mock(side_effect=lambda url: self.r.result(url, 'unverified'))
+        self.r.run_queue([self.product, second], 'all')
+        self.assertEqual([c.args[0] for c in self.r.process.call_args_list], [self.product, second])
+        self.assertFalse(any(r['state'] == 'verified' for r in self.r.results))
+
+    def test_verified_products_are_rechecked_after_utc_day_change(self):
+        self.r.process = Mock(side_effect=lambda url: self.r.result(
+            url, 'verified', timestamp=timestamp(self.now), original=url))
+        self.r.run_queue([self.product], 'all')
+        self.now += 86400
+        self.restart()
+        self.r.process = Mock(side_effect=lambda url: self.r.result(url, 'unverified'))
+        self.r.run_queue([self.product], 'all')
+        self.r.process.assert_called_once_with(self.product)
+        self.assertFalse(any(r['state'] == 'verified' for r in self.r.results))
+
+    def test_reused_evidence_does_not_hide_unresolved_products_or_other_modes(self):
+        second = BASE + '/products/second-watch'
+        def first_pass(url):
+            if url == self.product:
+                return self.r.result(url, 'verified', timestamp=timestamp(self.now), original=url)
+            return self.r.result(url, 'pending')
+        self.r.process = Mock(side_effect=first_pass)
+        self.r.run_queue([self.product, second], 'all')
+        self.restart()
+        self.r.process = Mock(side_effect=lambda url: self.r.result(url, 'pending'))
+        self.r.run_queue([self.product, second], 'all')
+        self.r.process.assert_called_once_with(second)
+        self.assertEqual({r['url'] for r in self.r.results if r['state'] == 'verified'}, {self.product})
+        self.r = Runner(self.c, 'state.json', verify_only=True)
+        self.r.process = Mock(side_effect=lambda url: self.r.result(url, 'unverified'))
+        self.r.run_queue([self.product, second], 'all')
+        self.assertEqual(self.r.process.call_count, 2)
+
+    def test_retained_evidence_survives_interrupted_new_product(self):
+        second = BASE + '/products/second-watch'
+        key = 'all:20261104:capture:daily-v2'
+        verified = {'url': self.product, 'state': 'verified', 'timestamp': timestamp(self.now)}
+        self.r.state['_queues'] = {key: {'urls': [second], 'cursor': 0,
+            'complete': False, 'started': second, 'results': [verified]}}
+        pending = {'job_id': 'accepted-second', 'submitted_at': self.now - 60}
+        self.r.state[second] = dict(pending)
+        self.r.save()
+        self.restart().run_queue([self.product, second], 'all')
+        self.assertIn(verified, self.r.state['_queues'][key]['results'])
+        self.assertEqual(self.r.state[second], pending)
+        self.assertEqual(self.calls, [])
+
+    def test_http_200_payload_pause_stops_then_retains_job_for_review(self):
+        # Transferred reproduction, now asserts the bounded review transition.
+        contact = BASE + '/pages/contact'
+        warranty = BASE + '/pages/warranty-policy'
+        self.post_response = (200, {}, {'job_id': 'accepted-contact'})
+        self.status_response = (200, {}, {'status': 'error', 'message':
+            'crawling this host is paused; HTTP status=429; overloaded'})
+        self.r.run_queue([contact, warranty], 'priority')
+        self.r.run_queue([self.product], 'all')
+        self.assertTrue(self.r.pause_circuit_open)
+        self.assertEqual(self.r.state[contact]['job_id'], 'accepted-contact')
+        self.assertTrue(self.r.state[contact]['review_required'])
+        self.assertEqual(self.r.state[contact]['paused_job_errors'], 3)
+        self.assertEqual(self.r.state[contact]['status_response']['http_status'], 200)
+        self.assertEqual(self.r.state[contact]['status_response']['pause_triggers'],
+            ['host_pause_message', 'reported_http_429', 'overloaded'])
+        os.environ['GITHUB_RUN_ID'] = '12346'
+        self.restart()
+        before = len(self.calls)
+        due = self.r.next_submit
+        self.assertEqual(self.r.process(contact)['state'], 'review_required')
+        self.assertGreaterEqual(self.calls[before][2], due)
+        self.assertEqual(self.r.state[contact]['job_id'], 'accepted-contact')
+        self.assertFalse(self.r.pause_circuit_open)
+        self.assertEqual([url for url, _ in self.posts()], [contact])
+        statuses = [(u, at) for u, _, at in self.calls if '/save/status/' in u]
+        self.assertEqual(len(statuses), 3)
+        self.assertTrue(all(b[1] - a[1] >= 1200 for a, b in zip(statuses, statuses[1:])))
+        self.assertFalse(any(warranty in u or self.product in u for u, _, _ in self.calls))
 
     def test_same_day_rejected_product_only_one_post_and_next_day_allowed(self):
         self.assertEqual(self.r.process(self.product)['state'], 'failed')
@@ -2860,6 +3160,240 @@ class DailyPolicyRunnerTests(unittest.TestCase):
 # Keep additional regressions discoverable through the unchanged production CI command.
 from test_verification_candidate import CDXSchemaCandidateTests, CanonicalParserCandidateTests
 from test_legacy_state import LegacyStateTests
+
+class DailyBatchPipelineTests(unittest.TestCase):
+    product = BASE + '/products/ice-blue-watch'
+    advance = DailyPolicyRunnerTests.advance
+    posts = DailyPolicyRunnerTests.posts
+    restart = DailyPolicyRunnerTests.restart
+
+    def setUp(self):
+        from capture import epoch
+        self.jobs = {}
+        self.calls = []
+        self.pause_url = None
+        self.pause_status = 200
+        self.index_unavailable = False
+        self.hide_index = set()
+        self.crash_after_post = False
+        self.fail_replay = None
+        self.index_lag = 0
+        DailyPolicyRunnerTests.setUp(self)
+        self.now = epoch('20261104000700')
+        self.since = epoch('20261104000000')
+        self.restart(budget=19800)
+
+    def request(self, url, data=None, authenticated=False):
+        from urllib.parse import parse_qs, urlsplit
+        self.calls.append((url, data, self.now))
+        self.now += 2  # Completion-based gate must include request duration.
+        if data is not None:
+            saved = json.loads(Path(self.r.state_path).read_text())
+            target = data['url']
+            self.assertEqual(saved[target]['request_evidence']['attempts'][-1]['started_at'], self.calls[-1][2])
+            self.assertNotIn(target, self.jobs, 'duplicate physical submission')
+            self.jobs[target] = {'id': 'accepted-' + str(len(self.jobs)), 'at': self.now}
+            if self.crash_after_post:
+                self.crash_after_post = False
+                raise KeyboardInterrupt('synthetic interruption after acceptance')
+            return 200, {}, json.dumps({'job_id': self.jobs[target]['id']}), url
+        if '/save/status/' in url:
+            target = next(u for u, row in self.jobs.items() if row['id'] == url.rsplit('/', 1)[-1])
+            if target == self.pause_url:
+                return self.pause_status, {}, json.dumps({'status': 'error', 'message':
+                    'crawling this host is paused; HTTP status=429; overloaded'}), url
+            return 200, {}, json.dumps({'status': 'success', 'timestamp': timestamp(self.jobs[target]['at']),
+                                        'original_url': target}), url
+        if '/cdx/' in url:
+            if self.index_unavailable:
+                return 200, {}, json.dumps([FIELDS, ['bad-row']]), url
+            query = parse_qs(urlsplit(url).query)
+            rows = [FIELDS]
+            lower, upper = query['from'][0], query['to'][0]
+            for target, row in self.jobs.items():
+                ts = timestamp(row['at'])
+                if (target not in self.hide_index and self.now - row['at'] >= self.index_lag
+                        and lower <= ts <= upper
+                        and (query['matchType'][0] == 'host' or query['url'][0] == target)):
+                    rows.append([ts, target, '200', 'text/html', 'digest'])
+            return 200, {}, json.dumps(rows), url
+        original = url.split('id_/', 1)[1]
+        if self.fail_replay == original:
+            raise LookupFailure('synthetic replay transport failure')
+        body = GOOD
+        if '/products/' in original:
+            name = original.rsplit('/', 1)[-1].replace('-', ' ').title()
+            node = {'@type': 'Product', 'url': original, '@id': original + '#product', 'name': name,
+                    'offers': {'price': '339.99', 'priceCurrency': 'USD'}}
+            body = ('<html><title>' + name + ' – Somerville Watch Co.</title>'
+                    '<script type="application/ld+json">' + json.dumps(node) + '</script>'
+                    '<body><h1>' + name + '</h1>' + 'Watch details ' * 80 + '</body></html>')
+        return 200, {'content-type': 'text/html'}, body, url
+
+    def verified(self):
+        return {r['url'] for r in self.r.results if r.get('state') == 'verified'
+                and r.get('timestamp', '').startswith(timestamp(self.r.since)[:8])}
+
+    def test_all_166_fresh_targets_complete_with_four_330_minute_windows(self):
+        from capture import PRIORITY
+        priority = [BASE + path for path in PRIORITY]
+        products = [BASE + '/products/watch-' + str(i) for i in range(154)]
+        targets = priority + products
+        windows = []
+        for i in range(4):
+            self.now = self.since + i * 21600 + 420
+            os.environ['GITHUB_RUN_ID'] = str(50000 + i)
+            self.restart(budget=19800)
+            started = self.now
+            self.r.run_daily_queue(priority, 'priority')
+            self.r.run_daily_queue(products, 'all')
+            windows.append(self.now - started)
+            self.assertLessEqual(windows[-1], 19800)
+        self.assertEqual(self.verified(), set(targets))
+        self.assertEqual(len(self.posts()), 166)
+        self.assertEqual(len({u for u, _ in self.posts()}), 166)
+        self.assertLess(len(self.calls), 560)
+        self.assertTrue(all(at < self.since + 86400 for _, at in self.posts()))
+        self.assertTrue(all(b[2] - a[2] >= 122 for a, b in zip(self.calls, self.calls[1:])))
+        print('PIPELINE_METRIC ' + json.dumps({'targets': len(targets), 'requests': len(self.calls),
+            'posts': len(self.posts()), 'window_seconds': windows, 'finished_utc': timestamp(self.now)}))
+
+    def test_incomplete_index_stops_all_later_work_without_submission(self):
+        self.index_unavailable = True
+        self.r.run_daily_queue([URL], 'priority')
+        self.r.run_daily_queue([self.product], 'all')
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.r.state['_queues']['priority:20261104:capture:daily-v3']['phase'], 'index_before')
+        self.assertFalse(self.verified())
+
+    def test_restart_after_unknown_acceptance_never_resubmits(self):
+        self.crash_after_post = True
+        self.hide_index.add(self.product)
+        with self.assertRaises(KeyboardInterrupt):
+            self.r.run_daily_queue([self.product], 'all')
+        pending = json.loads(json.dumps(self.r.state[self.product]))
+        self.restart().run_daily_queue([self.product], 'all')
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual(self.r.state[self.product], pending)
+        self.assertFalse(self.verified())
+
+    def test_restart_recovers_partial_replay_proof_without_recapturing(self):
+        second = BASE + '/products/second-watch'
+        self.fail_replay = second
+        self.r.run_daily_queue([self.product, second], 'all')
+        self.assertEqual(self.verified(), {self.product})
+        key = 'all:20261104:capture:daily-v3'
+        self.assertEqual(self.r.state['_queues'][key]['phase'], 'index_after')
+        self.fail_replay = None
+        self.restart().run_daily_queue([self.product, second], 'all')
+        self.assertEqual(self.verified(), {self.product, second})
+        self.assertEqual(len(self.posts()), 2)
+
+    def test_index_lag_retains_jobs_and_reconciles_next_pass(self):
+        self.index_lag = 10000
+        self.r.run_daily_queue([self.product], 'all')
+        self.assertFalse(self.verified())
+        self.assertIn(self.product, self.r.state)
+        self.now += 10000
+        self.restart().run_daily_queue([self.product], 'all')
+        self.assertEqual(self.verified(), {self.product})
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_new_inventory_joins_unfinished_queue(self):
+        second = BASE + '/products/second-watch'
+        self.restart(budget=300).run_daily_queue([self.product], 'all')
+        self.assertEqual(self.posts(), [])
+        self.restart().run_daily_queue([self.product, second], 'all')
+        self.assertEqual(self.verified(), {self.product, second})
+        self.assertEqual(len(self.posts()), 2)
+
+    def test_verified_daily_v2_evidence_is_reused_and_history_preserved(self):
+        key = 'all:20261104:capture:daily-v2'
+        prior = {'urls': [self.product], 'cursor': 1, 'complete': True,
+                 'results': [{'url': self.product, 'state': 'verified', 'timestamp': '20261104000100'}]}
+        self.r.state['_queues'] = {key: prior}
+        self.r.save()
+        self.r.run_daily_queue([self.product], 'all')
+        self.assertEqual(self.verified(), {self.product})
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.r.state['_queues'][key], prior)
+
+    def test_outlink_hold_stops_before_any_other_submission(self):
+        reason = 'current outlink expansion unresolved'
+        self.r.outlink_submission_hold = Mock(return_value=reason)
+        self.r.run_daily_queue([URL, BASE + '/cart'], 'priority')
+        self.r.run_daily_queue([self.product], 'all')
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(self.r.outlink_hold['url'], URL)
+        self.assertEqual(self.r.outlink_hold['reason'], reason)
+
+    def test_three_paused_job_errors_stop_then_allow_later_pages_after_cooldown(self):
+        contact, warranty = BASE + '/pages/contact', BASE + '/pages/warranty-policy'
+        self.pause_url = contact
+        self.hide_index.add(contact)
+        self.r.run_daily_queue([contact, warranty], 'priority')
+        self.assertTrue(self.r.pause_circuit_open)
+        self.assertTrue(self.r.state[contact]['review_required'])
+        self.assertEqual(self.r.state[contact]['paused_job_errors'], 3)
+        held = self.r.state[contact]['job_id']
+        self.assertEqual([u for u, _ in self.posts()], [contact])
+        due, before = self.r.next_submit, len(self.calls)
+        os.environ['GITHUB_RUN_ID'] = '12346'
+        self.restart().run_daily_queue([contact, warranty], 'priority')
+        self.assertGreaterEqual(self.calls[before][2], due)
+        self.assertIn(warranty, self.verified())
+        self.assertEqual(self.r.state[contact]['job_id'], held)
+        self.assertEqual(sum('/save/status/' + held in u for u, _, _ in self.calls), 3)
+        self.assertEqual([u for u, _ in self.posts()], [contact, warranty])
+
+    def test_actual_status_http_429_does_not_quarantine_the_accepted_job(self):
+        contact = BASE + '/pages/contact'
+        self.pause_url, self.pause_status = contact, 429
+        self.hide_index.add(contact)
+        self.r.run_daily_queue([contact], 'priority')
+        self.assertTrue(self.r.pause_circuit_open)
+        self.assertFalse(self.r.state[contact].get('review_required'))
+        self.assertEqual(self.r.state[contact]['paused_job_errors'], 0)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_verify_and_poll_modes_never_post(self):
+        for mode in ('verify', 'poll'):
+            with self.subTest(mode=mode):
+                self.r = Runner(self.c, 'state.json', verify_only=mode == 'verify', poll_only=mode == 'poll')
+                self.r.run_daily_queue([self.product], 'all')
+        self.assertEqual(self.posts(), [])
+        self.assertTrue(all('/save/status/' not in u for u, _, _ in self.calls))
+
+    def test_utc_rollover_stops_new_submissions_and_does_not_reuse_old_coverage(self):
+        self.now = self.since + 86400 - 600
+        products = [BASE + '/products/watch-' + str(i) for i in range(8)]
+        self.restart(budget=3600).run_daily_queue(products, 'all')
+        self.assertTrue(all(at < self.since + 86400 for _, at in self.posts()))
+        self.assertLess(len(self.posts()), len(products))
+        self.now = self.since + 86400 + 420
+        self.r = Runner(self.c, 'state.json', verify_only=True)
+        self.r.run_daily_queue(products, 'all')
+        self.assertFalse(self.verified())
+
+    def test_invalid_batch_checkpoint_is_held_before_io(self):
+        from capture import StateContinuityError
+        key = 'all:20261104:capture:daily-v3'
+        self.r.state['_queues'] = {key: {'urls': [self.product], 'cursor': 0, 'complete': False,
+            'results': [], 'phase': 'capture', 'batch_start': 0, 'batch_end': 99}}
+        with self.assertRaises(StateContinuityError):
+            self.r.save()
+        self.assertEqual(self.calls, [])
+
+    def test_main_reports_failure_when_only_products_are_missing(self):
+        from capture import main, PRIORITY
+        for i, path in enumerate(PRIORITY):
+            self.jobs[BASE + path] = {'id': 'existing-' + str(i), 'at': self.since + 60}
+        with patch('sys.argv', ['capture.py', '--scope', 'all', '--daily-batches', '--verify-only', '--state', 'state.json']), \
+                patch('capture.Client', return_value=self.c), patch('capture.discover', return_value=[self.product]):
+            self.assertEqual(main(), 1)
+        self.assertEqual(self.posts(), [])
+
 
 if __name__ == '__main__': unittest.main()
 

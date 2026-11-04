@@ -1,8 +1,7 @@
 name: Daily Wayback Machine Policy Snapshot
 on:
   schedule:
-    - cron: '7 8 * * *'
-    - cron: '43 9 * * *'
+    - cron: '7 0,6,12,18 * * *'
   workflow_dispatch:
     inputs:
       scope:
@@ -65,6 +64,9 @@ jobs:
           VERIFY_ONLY: ${{ inputs.verify_only && 'true' || 'false' }}
         run: |
           args=(--scope "$SCOPE" --outlink-page "$OUTLINK_PAGE")
+          if [[ "$SCOPE" == all || "$SCOPE" == priority ]]; then
+            args+=(--daily-batches --budget 19800)
+          fi
           if [[ -n "$RECOVERY_CACHE_KEY" ]]; then
             args+=(--poll-only)
           elif [[ "$VERIFY_ONLY" == true ]]; then

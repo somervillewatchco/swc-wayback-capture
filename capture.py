@@ -126,6 +126,23 @@ def response_metadata(http_status, headers, obj):
         ('reported_http_429', bool(re.search(r'http status\s*[=:]\s*429\b', detail))),
         ('overloaded', 'overloaded' in detail),
     ) if matched]
+    # The provider can put an explanatory error in either text field. Preserve
+    # only its allowlisted meaning, even when status_ext is not a known enum.
+    safe_detail = ' '.join(value.lower() for value in
+                          (obj.get('status_ext'), obj.get('message'))
+                          if isinstance(value, str))
+    result['pause_reported_in'] = [field for field in ('status_ext', 'message')
+        if isinstance(obj.get(field), str) and (
+            'host-crawling-paused' in obj[field].lower()
+            or 'crawling this host is paused' in obj[field].lower()
+            or 'overloaded' in obj[field].lower()
+            or re.search(r'http status\s*[=:]\s*429\b', obj[field], re.I))]
+    if 'host-crawling-paused' in safe_detail or 'crawling this host is paused' in safe_detail:
+        result['message_category'] = 'host_paused'
+    reported_codes = sorted({int(code) for code in
+        re.findall(r'\bhttp status\s*[:=]\s*([1-5][0-9]{2})\b', safe_detail)})
+    if reported_codes:
+        result['provider_reported_http_statuses'] = reported_codes
     reported = re.search(r'\bhttp status\s*[:=]\s*([1-5][0-9]{2})\b', message)
     if reported:
         result['message_reported_http_status'] = int(reported.group(1))
@@ -251,7 +268,7 @@ def operational_summary(state):
     for key, queue in queue_map.items():
         if not isinstance(key, str) or not isinstance(queue, dict):
             continue
-        if not re.fullmatch(r'(all|priority|pilot|supplemental|transport_probe|pacing_probe|supplemental_probe):[0-9]{8}:(capture|poll|verify)(?::daily-v2)?(?::pass:[0-9]+)?', key):
+        if not re.fullmatch(r'(all|priority|pilot|supplemental|transport_probe|pacing_probe|supplemental_probe):[0-9]{8}:(capture|poll|verify)(?::daily-v[23])?(?::pass:[0-9]+)?', key):
             continue
         urls = queue.get('urls', [])
         total = len(urls) if isinstance(urls, list) else 0
@@ -268,6 +285,8 @@ def operational_summary(state):
         queues.append({'key': key, 'total': total, 'cursor': cursor,
                        'remaining': max(0, total - cursor), 'complete': queue.get('complete') is True,
                        'in_flight': queue.get('started') is not None, 'processed_result_counts': counts})
+        if queue.get('phase') in ('index_before', 'capture', 'index_after'):
+            queues[-1]['phase'] = queue['phase']
     def safe_time(key):
         value = state.get(key, 0)
         return value if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < 1e15 else 0
@@ -536,10 +555,63 @@ class Client:
             'to': timestamp(upper), 'output': 'json',
             'fl': 'timestamp,original,statuscode,mimetype,digest'})
         status, _, data = self.json('https://web.archive.org/cdx/search/cdx?' + query)
+        return self.verify_rows(url, since, upper, self.cdx_rows(status, data))
+
+    def verify_many(self, urls, since, until=None):
+        """Read-only daily evidence iterator; never authorizes a submission.
+
+        One bounded, complete host index query serves the known daily targets.
+        Every positive result still needs an individual exact replay. A None
+        result means only that this snapshot did not yield usable evidence;
+        it is not proof that a pending or uncertain job can be resubmitted.
+        The capture scheduler does not use this proposal component yet.
+        """
+        if (not isinstance(urls, (list, tuple)) or len(urls) > 5000
+                or any(not isinstance(url, str) or not (
+                    url in {BASE + path for path in PRIORITY} or is_product(url))
+                    for url in urls)):
+            raise LookupFailure('Shared index requires known daily target URLs')
+        targets = list(dict.fromkeys(urls))
+        if not targets:
+            return
+        if (not _number(since) or not timestamp(since).endswith('000000')
+                or since != epoch(timestamp(since))
+                or (until is not None and (not _number(until)
+                    or not since <= until < since + 86400))):
+            raise LookupFailure('Shared index requires one exact UTC-day window')
+        upper = min(since + 86399, time.time() + 60,
+                    until if until is not None else since + 86399)
+        if upper < since:
+            raise LookupFailure('Shared index day has not begun')
+        # showResumeKey also reveals a server-side cap below our requested cap.
+        # A continuation or a full-size response fails closed; no pagination,
+        # partial evidence, or negative-cache assumption leaks to callers.
+        limit = 5000
+        query = up.urlencode({'url': BASE + '/', 'matchType': 'host',
+            'from': timestamp(since), 'to': timestamp(upper), 'output': 'json',
+            'fl': 'timestamp,original,statuscode,mimetype,digest',
+            'filter': ['statuscode:2[0-9]{2}',
+                       r'mimetype:(text/html|application/xhtml\+xml|warc/revisit)'],
+            'limit': limit, 'showResumeKey': 'true'}, doseq=True)
+        status, _, data = self.json('https://web.archive.org/cdx/search/cdx?' + query)
+        if isinstance(data, list) and len(data) > limit:
+            raise LookupFailure('Shared CDX response reached its bounded row limit')
+        rows = self.cdx_rows(status, data)
+        # Validate every row before the first replay or emitted result, even
+        # when the malformed row is for a URL outside the supplied inventory.
+        by_url = {url: [] for url in targets}
+        for row, captured in rows:
+            if row['original'] in by_url:
+                by_url[row['original']].append((row, captured))
+        for url in targets:
+            yield url, self.verify_rows(url, since, upper, by_url[url])
+
+    @staticmethod
+    def cdx_rows(status, data):
         if status != 200 or not isinstance(data, list):
             raise LookupFailure('CDX unavailable')
         if not data:
-            return None
+            return []
         fields = data[0]
         expected = {'timestamp', 'original', 'statuscode', 'mimetype', 'digest'}
         if (not isinstance(fields, list) or len(fields) != len(expected)
@@ -575,6 +647,9 @@ class Client:
             if not re.fullmatch(r"(?:[A-Za-z0-9!#$&^_.+\-]+/[A-Za-z0-9!#$&^_.+\-]+|-)", row['mimetype']):
                 raise LookupFailure('Invalid CDX MIME type')
             rows.append((row, captured))
+        return rows
+
+    def verify_rows(self, url, since, upper, rows):
         for row, captured in reversed(rows):
             if not row['statuscode'].startswith('2') or row['mimetype'] not in ('text/html', 'application/xhtml+xml', 'warc/revisit'):
                 continue
@@ -985,6 +1060,15 @@ def validate_state(state):
                 for marker in ('started', 'retry_same_url'):
                     if queue.get(marker) is not None and (cursor >= len(urls) or queue[marker] != urls[cursor]):
                         _reject('Inconsistent interrupted queue operation')
+                if ':daily-v3' in qkey:
+                    start, end = queue.get('batch_start'), queue.get('batch_end')
+                    if (queue.get('phase') not in ('index_before', 'capture', 'index_after')
+                            or type(start) is not int or type(end) is not int
+                            or not 0 <= start <= cursor <= end <= len(urls)
+                            or end - start > 8
+                            or (queue['phase'] == 'index_after' and cursor != end)
+                            or (queue['complete'] and cursor != len(urls))):
+                        _reject('Invalid daily batch checkpoint')
         elif key == '_outlink_batches':
             if not isinstance(value, dict):
                 _reject('Invalid outlink journal map')
@@ -1026,6 +1110,9 @@ def validate_state(state):
             job = value.get('job_id')
             if job is not None and (not isinstance(job, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', job)):
                 _reject('Invalid retained job ID')
+            if ('paused_job_errors' in value and (type(value['paused_job_errors']) is not int
+                    or not 0 <= value['paused_job_errors'] <= 3)):
+                _reject('Invalid paused-job observation count')
             for name in ('submitted_at', 'retry_eligible_at', 'server_retry_after_until', 'status_paused_until', 'retry_not_before', 'next_status_at'):
                 if name in value and not _number(value[name]):
                     _reject('Invalid pending job time')
@@ -1126,7 +1213,7 @@ class Runner:
             row['job_id'] = job_id
         if isinstance(pending.get('submitted_at'), (int, float)):
             row['submitted_at'] = pending['submitted_at']
-        for key in ('status_evidence', 'request_evidence', 'terminal_reused', 'retry_eligible_at', 'review_required', 'submission_response', 'status_response', 'transport_failure', 'known_not_sent', 'status_error', 'server_retry_after_until', 'status_paused_until', 'next_status_at', 'job_diagnostic'):
+        for key in ('status_evidence', 'request_evidence', 'terminal_reused', 'retry_eligible_at', 'review_required', 'submission_response', 'status_response', 'transport_failure', 'known_not_sent', 'status_error', 'server_retry_after_until', 'status_paused_until', 'next_status_at', 'job_diagnostic', 'paused_job_errors'):
             if key in pending:
                 row[key] = pending[key]
         return row
@@ -1278,7 +1365,7 @@ class Runner:
         self.save()
         return self.result(url, 'reused', reason='completed capture predates UTC day; no new submission in this run')
 
-    def process(self, url):
+    def process(self, url, *, shared_index=False):
         # A per-run circuit counts URL operations with exhausted Archive
         # transport failures; successful intermediate CDX reads cannot erase a
         # subsequent failed POST/status lookup for the same URL.
@@ -1290,7 +1377,7 @@ class Runner:
         before_healthy = getattr(self.client, 'archive_healthy_responses', 0)
         self._operation_transport_failed = False
         self._operation_paused = False
-        row = self._process(url)
+        row = self._process(url, shared_index=True) if shared_index else self._process(url)
         if self._operation_paused and row.get('state') != 'verified':
             row['retry_same_url'] = True
         after_failed = getattr(self.client, 'archive_transport_failures', 0)
@@ -1384,7 +1471,9 @@ class Runner:
         if not queue or queue.get('complete') or revisit_priority:
             retry_url = queue.get('retry_same_url') if queue else None
             verified = [r for r in queue['results'] if r.get('state') == 'verified'
-                        and str(r.get('timestamp', '')).startswith(timestamp(self.since)[:8])] if queue and scope == 'priority' else []
+                        and r.get('url') in urls
+                        and re.fullmatch(timestamp(self.since)[:8] + r'[0-9]{6}',
+                                         str(r.get('timestamp', '')))] if queue and scope in ('all', 'priority') else []
             if queue:
                 history_key = key + ':pass:' + str(len(queues))
                 while history_key in queues:
@@ -1398,6 +1487,10 @@ class Runner:
             queue = {'urls': remaining, 'cursor': 0,
                      'results': verified, 'complete': False}
             queues[key] = queue
+        # Retain carried same-day evidence even when its URL is no longer in
+        # the remaining queue. Otherwise processing one new product drops it.
+        report_urls = set(queue['urls']) | {r.get('url') for r in queue['results']
+                                          if r.get('state') == 'verified'}
         self.results.extend(queue['results'])
         for row in queue['results']:
             print(json.dumps(row), flush=True)
@@ -1407,7 +1500,7 @@ class Runner:
         if queue.get('started') is not None and queue.get('retry_same_url') != queue['started']:
             url = queue['urls'][queue['cursor']]
             self.result(url, 'unverified', reason='interrupted URL operation; resume skips it, pending state preserved')
-            queue['results'] = [r for r in self.results if r.get('url') in queue['urls'] or (scope == 'priority' and r.get('url') in {BASE + p for p in PRIORITY})]
+            queue['results'] = [r for r in self.results if r.get('url') in report_urls]
             queue['cursor'] += 1
             queue.pop('started', None)
         queue.pop('started', None)
@@ -1446,7 +1539,7 @@ class Runner:
                     break
             if isinstance(row, dict) and row.get('retry_same_url'):
                 queue.pop('started', None)
-                queue['results'] = [r for r in self.results if r.get('url') in queue['urls'] or (scope == 'priority' and r.get('url') in {BASE + p for p in PRIORITY})]
+                queue['results'] = [r for r in self.results if r.get('url') in report_urls]
                 self.save()
                 delay = max(0, self.next_submit - time.time(), self.client.archive_next_request_at - time.time())
                 if self.pause_circuit_open or time.time() + delay + 120 >= self.deadline:
@@ -1456,13 +1549,158 @@ class Runner:
             queue['cursor'] += 1
             queue.pop('started', None)
             queue.pop('retry_same_url', None)
-            queue['results'] = [r for r in self.results if r.get('url') in queue['urls'] or (scope == 'priority' and r.get('url') in {BASE + p for p in PRIORITY})]
+            queue['results'] = [r for r in self.results if r.get('url') in report_urls]
             self.save()
         queue['complete'] = queue['cursor'] == len(queue['urls'])
         self.save()
         # These reporting rows do not advance the saved cursor/results.
         for url in queue['urls'][queue['cursor']:]:
             self.result(url, 'deferred', reason='three consecutive paused Archive responses; not captured' if self.pause_circuit_open else 'untouched queue checkpoint saved; recovery cycles or run budget exhausted')
+
+    def run_daily_queue(self, urls, scope):
+        """Resume bounded capture/status batches between shared index reads.
+
+        The old queues remain history. Negative index results are never reused
+        across invocations; accepted/uncertain jobs always follow _process's
+        retained-state checks. Every stage uses the same Archive request gate.
+        """
+        if scope not in ('all', 'priority'):
+            raise ValueError('Daily batches require all or priority scope')
+        mode = 'verify' if self.verify_only else 'poll' if self.poll_only else 'capture'
+        prefix = scope + ':' + timestamp(self.since)[:8] + ':' + mode
+        key = prefix + ':daily-v3'
+        queues = self.state.setdefault('_queues', {})
+        queue = queues.get(key)
+        # Daily-v2 evidence already passed the same strict verifier. Carry
+        # positive evidence only; never import an old cursor or absent result.
+        previous = queue or queues.get(prefix + ':daily-v2')
+        targets = list(dict.fromkeys(urls))
+        rebuild = not queue or queue['complete'] or scope == 'priority'
+        if rebuild:
+            verified = [r for r in (previous or {}).get('results', [])
+                        if r.get('state') == 'verified' and r.get('url') in targets
+                        and re.fullmatch(timestamp(self.since)[:8] + r'[0-9]{6}', str(r.get('timestamp', '')))]
+            if queue:
+                history = key + ':pass:' + str(len(queues))
+                while history in queues:
+                    history += '0'
+                queues[history] = queue
+            covered = {r['url'] for r in verified}
+            remaining = [u for u in targets if u not in covered]
+            retry = (previous or {}).get('retry_same_url')
+            if retry in remaining:
+                remaining.remove(retry)
+                remaining.insert(0, retry)
+            queue = {'urls': remaining, 'cursor': 0, 'results': verified, 'complete': False,
+                     'phase': 'index_before', 'batch_start': 0, 'batch_end': min(8, len(remaining))}
+            queues[key] = queue
+        else:
+            # Newly discovered products join untouched work. Removed targets
+            # remain in history but are not submitted by this invocation.
+            known = set(queue['urls']) | {r.get('url') for r in queue['results']}
+            queue['urls'].extend(u for u in targets if u not in known)
+        report_urls = set(queue['urls']) | {r.get('url') for r in queue['results']}
+        self.results.extend(queue['results'])
+        for row in queue['results']:
+            print(json.dumps(row), flush=True)
+        if queue.get('started') is not None and queue.get('retry_same_url') != queue['started']:
+            self.result(queue['started'], 'unverified', reason='interrupted URL operation; pending state preserved')
+            queue['cursor'] += 1
+            queue.pop('started', None)
+        # No stale negative snapshot grants a new capture after a restart.
+        if queue['phase'] == 'capture':
+            queue['phase'] = 'index_before'
+
+        def checkpoint():
+            queue['results'] = [r for r in self.results if r.get('url') in report_urls]
+            self.save()
+
+        checkpoint()
+        while not queue['complete']:
+            if (getattr(self, 'daily_stopped', False) or getattr(self, 'outlink_hold', None)
+                    or self.pause_circuit_open or self.transport_circuit_open
+                    or self.state.get('_transport_cooldown_until', 0) > time.time()
+                    or time.time() + 120 >= min(self.deadline, self.since + 86400)):
+                break
+            start, end = queue['batch_start'], queue['batch_end']
+            covered = {r['url'] for r in queue['results'] if r.get('state') == 'verified'}
+            if queue['phase'] in ('index_before', 'index_after'):
+                before = queue['phase'] == 'index_before'
+                selection = queue['urls'][queue['cursor'] if before else start:end]
+                selection = [u for u in selection if u in targets and u not in covered]
+                try:
+                    for url, evidence in self.client.verify_many(selection, self.since, until=self.until):
+                        if evidence:
+                            self.verified_result(url, evidence, 'shared_index')
+                        else:
+                            self.result(url, 'unverified', reason='no usable capture in complete shared index snapshot')
+                        checkpoint()
+                except (LookupFailure, RequestDeferred, ValueError, OSError) as exc:
+                    # Preserve phase/cursor and positive proof. No partial
+                    # index is treated as permission for a new submission.
+                    for url in selection:
+                        if not any(r.get('url') == url and r.get('state') == 'verified' for r in queue['results']):
+                            self.result(url, 'deferred', reason='shared index/replay unavailable; batch checkpoint retained',
+                                        error_class=type(exc).__name__)
+                    checkpoint()
+                    break
+                if before and not self.verify_only:
+                    queue['phase'] = 'capture'
+                    checkpoint()
+                    continue
+                # A verification-only stage never performs a second index
+                # query or touches a submission/status endpoint.
+                queue['cursor'] = end
+                queue.pop('started', None)
+                queue.pop('retry_same_url', None)
+                queue['batch_start'] = end
+                queue['batch_end'] = min(end + 8, len(queue['urls']))
+                queue['phase'] = 'index_before'
+                queue['complete'] = end == len(queue['urls'])
+                checkpoint()
+                continue
+            if queue['cursor'] == end:
+                queue['phase'] = 'index_after'
+                checkpoint()
+                continue
+            url = queue['urls'][queue['cursor']]
+            if url in covered or url not in targets:
+                queue['cursor'] += 1
+                queue.pop('started', None)
+                queue.pop('retry_same_url', None)
+                checkpoint()
+                continue
+            queue['started'] = url
+            checkpoint()
+            self.active_queue = queue
+            try:
+                row = self.process(url, shared_index=True)
+            finally:
+                self.active_queue = None
+            queue.pop('started', None)
+            if row.get('state') == 'outlink-held':
+                self.outlink_hold = row
+                checkpoint()
+                break
+            if row.get('queue_untouched'):
+                checkpoint()
+                break
+            if row.get('retry_same_url'):
+                queue['retry_same_url'] = url
+                checkpoint()
+                delay = max(0, self.next_submit - time.time(), self.client.archive_next_request_at - time.time())
+                if self.pause_circuit_open or time.time() + delay + 120 >= min(self.deadline, self.since + 86400):
+                    break
+                time.sleep(delay)
+                continue
+            queue['cursor'] += 1
+            queue.pop('retry_same_url', None)
+            checkpoint()
+        if not queue['complete']:
+            self.daily_stopped = True
+        for url in queue['urls'][queue['cursor']:]:
+            if not any(r.get('url') == url and r.get('state') == 'verified' for r in queue['results']):
+                self.result(url, 'deferred', reason='daily batch checkpoint retained; coverage incomplete')
 
     def outlink_submission_hold(self, url):
         journals = self.state.get('_outlink_batches', {})
@@ -1773,12 +2011,12 @@ class Runner:
             self.save()
             return self.result(url, 'diagnostic-unavailable', reason='single saved-job status lookup failed; job retained')
 
-    def _process(self, url):
+    def _process(self, url, *, shared_index=False):
         created_pending = False
         if time.time() + 35 >= self.deadline:
             return self.result(url, 'deferred', reason='run time budget', queue_untouched=True)
         try:
-            evidence = self.client.verify(url, self.since, until=self.until)
+            evidence = None if shared_index else self.client.verify(url, self.since, until=self.until)
             if evidence:
                 return self.verified_result(url, evidence, 'existing_index')
             pending = self.state.get(url)
@@ -1893,6 +2131,18 @@ class Runner:
                     raise LookupFailure('Invalid status response')
                 obj['_http'] = status
                 pending['status_response'] = response_metadata(status, headers, obj)
+                if status == 200 and obj.get('status') == 'error' and pending['status_response']['pause_triggers']:
+                    pending['paused_job_errors'] = min(3, pending.get('paused_job_errors', 0) + 1)
+                    if pending['paused_job_errors'] == 3:
+                        # Repeated job-error payloads are not new submissions or
+                        # proof of non-acceptance. Quarantine this job for review
+                        # instead of polling it forever on every later run.
+                        # The current response still invokes the same host pause
+                        # and breaker below; the job/history are never removed.
+                        pending['status_error'] = True
+                        pending['review_required'] = True
+                else:
+                    pending['paused_job_errors'] = 0
                 if pending['status_response'].get('retry_after_until'):
                     pending['server_retry_after_until'] = max(pending.get('server_retry_after_until', 0),
                         pending['status_response']['retry_after_until'])
@@ -1937,7 +2187,7 @@ class Runner:
                     if original_matches:
                         pending['status_evidence']['original_url'] = url
                     self.save()
-                    resolved = self.classify_success(url, pending)
+                    resolved = self.classify_success(url, pending, check_daily=not shared_index)
                     if resolved:
                         return resolved
                     if not fresh or not original_matches:
@@ -1952,7 +2202,7 @@ class Runner:
                     pending['status_error'] = True
                     pending['review_required'] = True
                     self.save()
-                    evidence = self.client.verify(url, self.since, until=self.until)
+                    evidence = None if shared_index else self.client.verify(url, self.since, until=self.until)
                     if evidence:
                         return self.verified_result(url, evidence, 'status_error_reconciled_index')
                     return self.result(url, 'review_required', reason='job reported error; no usable indexed capture yet, no automatic resubmission')
@@ -2004,7 +2254,11 @@ def main():
     parser.add_argument('--state', default='.capture-state/pending.json')
     mode.add_argument('--inspect-state', action='store_true', help='Emit sanitized saved-state summary only; no network or state mutation')
     parser.add_argument('--budget', type=int, default=17400)
+    parser.add_argument('--daily-batches', action='store_true',
+                        help='Use resumable shared-index batches for daily all/priority scope')
     args = parser.parse_args()
+    if args.daily_batches and args.scope not in ('all', 'priority'):
+        parser.error('--daily-batches requires all or priority scope')
     if args.inspect_state:
         path = Path(args.state)
         try:
@@ -2062,8 +2316,11 @@ def main():
     elif args.scope == 'all':
         # Revisit unresolved tier 1 on every scheduled pass before resuming the
         # product checkpoint; earlier strict same-day evidence remains valid.
-        runner.run_queue([BASE + p for p in PRIORITY], 'priority')
-        runner.run_queue([url for url in urls if is_product(url)], 'all')
+        run_daily = runner.run_daily_queue if args.daily_batches else runner.run_queue
+        run_daily([BASE + p for p in PRIORITY], 'priority')
+        run_daily([url for url in urls if is_product(url)], 'all')
+    elif args.scope == 'priority' and args.daily_batches:
+        runner.run_daily_queue(urls, args.scope)
     else:
         runner.run_queue(urls, args.scope)
     counts = {state: sum(r['state'] == state for r in runner.results) for state in sorted({r['state'] for r in runner.results})}
@@ -2076,7 +2333,12 @@ def main():
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         Path(os.environ['GITHUB_STEP_SUMMARY']).write_text(summary)
     if args.scope in ('all', 'priority'):
-        return 1 if missing_priority or not inventory_complete else 0
+        missing_products = False
+        if args.daily_batches and args.scope == 'all':
+            verified = {row['url'] for row in runner.results if row.get('state') == 'verified'
+                        and re.fullmatch(timestamp(runner.since)[:8] + r'[0-9]{6}', str(row.get('timestamp', '')))}
+            missing_products = any(is_product(url) and url not in verified for url in urls)
+        return 1 if missing_priority or missing_products or not inventory_complete else 0
     return 0 if runner.results and all(r['state'] in ('verified', 'no-additional-targets') for r in runner.results) else 1
 
 if __name__ == '__main__':
