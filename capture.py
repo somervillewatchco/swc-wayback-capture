@@ -23,7 +23,7 @@ PRIORITY = ['/', '/policies/refund-policy', '/policies/shipping-policy',
  '/policies/terms-of-service', '/policies/privacy-policy',
  '/policies/contact-information', '/policies/legal-notice', '/pages/contact',
  '/pages/warranty-policy', '/pages/no-brand-affiliation',
- '/policies/subscription-policy', '/cart', '/cart/51183558787357:1?storefront=true']
+ '/policies/subscription-policy', '/cart']
 TRANSPORT_PROBE = BASE + '/products/date-mod-ice-blue-arabic-watch'
 PACING_PROBE = BASE + '/products/date-mod-olive-green-watch'
 SUPPLEMENTAL_PROBE = BASE + '/pages/about-us'
@@ -43,6 +43,9 @@ def identity(url):
     if p.scheme not in ('http', 'https') or p.hostname not in ('somervillewatchco.com', 'www.somervillewatchco.com'):
         return None
     return (p.path.rstrip('/') or '/', tuple(sorted(up.parse_qsl(p.query, keep_blank_values=True))))
+
+def is_product(url):
+    return bool(re.fullmatch(re.escape(BASE) + r'/products/[A-Za-z0-9-]+', url))
 
 def load_outlink_inventory():
     path = Path(__file__).with_name('outlink_inventory.json')
@@ -120,7 +123,8 @@ def response_metadata(http_status, headers, obj):
         ('http_429', http_status == 429),
         ('host_crawling_paused', 'host-crawling-paused' in detail),
         ('host_pause_message', 'crawling this host is paused' in detail),
-        ('reported_http_429', bool(re.search(r'http status\s*[=:]\s*429', detail))),
+        ('reported_http_429', bool(re.search(r'http status\s*[=:]\s*429\b', detail))),
+        ('overloaded', 'overloaded' in detail),
     ) if matched]
     reported = re.search(r'\bhttp status\s*[:=]\s*([1-5][0-9]{2})\b', message)
     if reported:
@@ -247,7 +251,7 @@ def operational_summary(state):
     for key, queue in queue_map.items():
         if not isinstance(key, str) or not isinstance(queue, dict):
             continue
-        if not re.fullmatch(r'(all|priority|pilot|supplemental|transport_probe|pacing_probe|supplemental_probe):[0-9]{8}:(capture|poll|verify)', key):
+        if not re.fullmatch(r'(all|priority|pilot|supplemental|transport_probe|pacing_probe|supplemental_probe):[0-9]{8}:(capture|poll|verify)(?::daily-v2)?(?::pass:[0-9]+)?', key):
             continue
         urls = queue.get('urls', [])
         total = len(urls) if isinstance(urls, list) else 0
@@ -358,12 +362,16 @@ class Client:
         self.archive_next_request_at = 0
         self.archive_deadline = float('inf')
         self.archive_pacing_callback = None
+        self.archive_response_callback = None
+        self.archive_requests_stopped = False
         self.post_utc_day_end = float('inf')
 
     def paced_request(self, url, data=None, authenticated=False, attempt=1):
         is_archive = up.urlsplit(url).hostname in ('web.archive.org', 'archive.org')
         gated = is_archive and self.archive_interval > 0
         if gated:
+            if self.archive_requests_stopped:
+                raise RequestDeferred('Three paused Archive responses; run stopped')
             # POST needs room for status, CDX and replay, each behind the same
             # gate. This is a minimum useful reserve, not a success guarantee.
             reserve = 4 * 35 + 3 * self.archive_interval if data is not None else 35
@@ -388,18 +396,30 @@ class Client:
             raise RequestDeferred('Intended UTC day ended during attempt persistence; no submission')
         response = None
         self.archive_observed_retry_after = 0
+        self.archive_observed_status = None
         try:
             response = self._request(url) if data is None and not authenticated else self._request(url, data, authenticated)
             return response
         finally:
             if gated:
+                code, headers, obj = self.archive_observed_status, {}, {}
                 until = max(time.time() + self.archive_interval, self.archive_observed_retry_after)
                 if response is not None:
+                    code = response[0]
                     headers = {k.lower(): v for k, v in response[1].items()}
-                    until = max(until, response_metadata(response[0], headers, {}).get('retry_after_until', 0))
+                    try:
+                        obj = json.loads(response[2])
+                    except (ValueError, TypeError, RecursionError):
+                        obj = {'message': response[2]}
+                    detail = response_metadata(response[0], headers, obj)
+                    until = max(until, detail.get('retry_after_until', 0))
+                    if detail['pause_triggers']:
+                        until = max(until, time.time() + 1200)
                 self.archive_next_request_at = max(self.archive_next_request_at, until)
                 if self.archive_pacing_callback:
                     self.archive_pacing_callback(self.archive_next_request_at)
+                if code is not None and self.archive_response_callback:
+                    self.archive_response_callback(url, code, headers, obj)
 
     def request(self, url, data=None, authenticated=False):
         is_archive = up.urlsplit(url).hostname == 'web.archive.org'
@@ -471,8 +491,12 @@ class Client:
                 response = exc
             with response:
                 if up.urlsplit(url).hostname in ('web.archive.org', 'archive.org'):
+                    self.archive_observed_status = response.status
                     safe_headers = {k.lower(): v for k, v in response.headers.items()}
                     self.archive_observed_retry_after = response_metadata(response.status, safe_headers, {}).get('retry_after_until', 0)
+                    if response.status == 429:
+                        # A failed body read must not discard an observed throttle.
+                        self.archive_observed_retry_after = max(self.archive_observed_retry_after, time.time() + 1200)
                 phase = 'read'
                 body = response.read(8 * 1024 * 1024 + 1)
                 if len(body) > 8 * 1024 * 1024:
@@ -498,14 +522,17 @@ class Client:
         try:
             obj = json.loads(body)
         except ValueError:
-            if status == 429:
-                return status, {k.lower(): v for k, v in headers.items()}, {'status': 'error', 'status_ext': 'http-429'}
+            if status == 429 or 'overloaded' in body.lower():
+                # A non-JSON overload has no proof of non-acceptance unless 429.
+                return status, {k.lower(): v for k, v in headers.items()}, {
+                    'status': 'error' if status == 429 else 'unknown',
+                    'status_ext': 'http-429' if status == 429 else 'overloaded'}
             raise LookupFailure('Non-JSON response (HTTP %s)' % status) from None
         return status, {k.lower(): v for k, v in headers.items()}, obj
 
     def verify(self, url, since, until=None):
         upper = min(until, time.time() + 60) if until is not None else time.time() + 60
-        query = up.urlencode({'url': url, 'matchType': 'exact', 'from': timestamp(since),
+        query = up.urlencode({'url': url, 'matchType': 'exact', 'from': timestamp(since)[:8] if timestamp(since).endswith('000000') else timestamp(since),
             'to': timestamp(upper), 'output': 'json',
             'fl': 'timestamp,original,statuscode,mimetype,digest'})
         status, _, data = self.json('https://web.archive.org/cdx/search/cdx?' + query)
@@ -549,19 +576,18 @@ class Client:
                 raise LookupFailure('Invalid CDX MIME type')
             rows.append((row, captured))
         for row, captured in reversed(rows):
-            if row['statuscode'] != '200' or row['mimetype'] not in ('text/html', 'application/xhtml+xml', 'warc/revisit'):
+            if not row['statuscode'].startswith('2') or row['mimetype'] not in ('text/html', 'application/xhtml+xml', 'warc/revisit'):
                 continue
-            if identity(row['original']) != identity(url) or not identity(url):
+            if row['original'] != url or not identity(url):
                 continue
             if not since <= captured <= upper:
                 continue
             replay = 'https://web.archive.org/web/' + row['timestamp'] + 'id_/' + row['original']
             code, headers, body, final = self.request(replay)
-            match = re.fullmatch(r'https?://web\.archive\.org/web/(\d{14})(?:id_)?/(https?://.*)', final)
-            if not match or match[1] != row['timestamp'] or identity(match[2]) != identity(url):
+            if final != replay:
                 continue  # Never accept Wayback's redirect to a different capture/page.
             lower = {k.lower(): v for k, v in headers.items()}
-            if code != 200 or 'html' not in lower.get('content-type', '') or not usable_html(body, url):
+            if not 200 <= code < 300 or 'html' not in lower.get('content-type', '').lower() or not usable_html(body, url):
                 continue
             return {**row, 'replay_url': replay, 'verified_at': timestamp(time.time())}
         return None
@@ -677,25 +703,116 @@ def canonical_links_match(body, url):
     return True
 
 
+class PageContent(HTMLParser):
+    """Active title/H1 text and bounded JSON-LD, never script/template lookalikes."""
+    IGNORED = frozenset(('script', 'style', 'template', 'noscript', 'svg', 'math', 'textarea'))
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.ignored = []
+        self.tag = None
+        self.parts = []
+        self.titles, self.headings, self.products = [], [], []
+        self.ld = None
+
+    def handle_starttag(self, tag, attrs):
+        if self.ignored:
+            if tag in self.IGNORED:
+                self.ignored.append(tag)
+            return
+        if tag in self.IGNORED:
+            self.ignored.append(tag)
+            if tag == 'script' and (dict(attrs).get('type') or '').lower() == 'application/ld+json':
+                self.ld = []
+        elif tag in ('title', 'h1'):
+            self.tag, self.parts = tag, []
+
+    def handle_data(self, data):
+        if self.ld is not None:
+            self.ld.append(data)
+        elif not self.ignored and self.tag:
+            self.parts.append(data)
+
+    def handle_endtag(self, tag):
+        if self.ignored:
+            if tag != self.ignored[-1]:
+                return
+            self.ignored.pop()
+            if tag == 'script' and self.ld is not None:
+                raw, self.ld = ''.join(self.ld), None
+                if len(raw) <= 1024 * 1024 and len(self.products) < 128:
+                    try:
+                        obj = json.loads(raw)
+                        nodes = obj if isinstance(obj, list) else [obj]
+                        for node in nodes[:128]:
+                            if isinstance(node, dict):
+                                graph = node.get('@graph', [node])
+                                if isinstance(graph, list):
+                                    self.products.extend(n for n in graph[:max(0, 128 - len(self.products))] if isinstance(n, dict))
+                    except (ValueError, RecursionError):
+                        pass
+        elif tag == self.tag:
+            (self.titles if tag == 'title' else self.headings).append(''.join(self.parts))
+            self.tag, self.parts = None, []
+
+    def product_matches(self, url, title):
+        normalize = lambda text: ' '.join(html.unescape(text).split()).casefold()
+        for node in self.products:
+            kind = node.get('@type')
+            if kind != 'Product' and not (isinstance(kind, list) and 'Product' in kind):
+                continue
+            refs = [node[k] for k in ('url', '@id') if k in node]
+            if not refs or any(not isinstance(ref, str) or up.urldefrag(up.urljoin(url, ref))[0] != url for ref in refs):
+                continue
+            name = node.get('name')
+            if (not isinstance(name, str) or not name.strip() or normalize(name) == 'somerville watch co.'
+                    or normalize(name) not in normalize(title)
+                    or normalize(name) not in [normalize(h) for h in self.headings]):
+                continue
+            offers = node.get('offers', [])
+            for offer in (offers if isinstance(offers, list) else [offers]):
+                if not isinstance(offer, dict):
+                    continue
+                price = str(offer.get('price', ''))
+                currency = offer.get('priceCurrency', '')
+                target = offer.get('url', url)
+                if not isinstance(target, str):
+                    continue
+                target = up.urlsplit(up.urljoin(url, target))
+                if (up.urlunsplit((target.scheme, target.netloc, target.path, '', '')) != url
+                        or any(k != 'variant' for k, _ in up.parse_qsl(target.query, keep_blank_values=True))):
+                    continue
+                if (re.fullmatch(r'[0-9]{1,12}(?:\.[0-9]{1,4})?', price) and float(price) > 0
+                        and isinstance(currency, str) and re.fullmatch(r'[A-Z]{3}', currency)):
+                    return True
+        return False
+
+
 def usable_html(body, url):
-    title = re.search(r'<title[^>]*>(.*?)</title>', body, re.I | re.S)
-    if len(body) < 512 or not title or not html.unescape(title[1]).strip():
+    page = PageContent()
+    try:
+        page.feed(body)
+        page.close()
+        if len(body) < 512 or len(page.titles) != 1:
+            return False
+        title = html.unescape(page.titles[0]).strip()
+        if 'Somerville Watch Co.' not in title:
+            return False
+        if re.search(r'just a moment|access denied|temporarily unavailable|robot check|page not found|verify you are human', title, re.I):
+            return False
+        if has_challenge_heading(body) or not canonical_links_match(body, url):
+            return False
+        if is_product(url):
+            return page.product_matches(url, title)
+    except (ValueError, RecursionError):
         return False
-    if re.search(r'just a moment|access denied|temporarily unavailable|robot check|page not found|verify you are human', title[1], re.I):
-        return False
-    # A normal store title does not make a verification interstitial usable.
-    # This is a rejection heuristic, not proof that remaining content is valid.
-    if has_challenge_heading(body):
-        return False
-    if not canonical_links_match(body, url):
-        return False
-    # Controlled cart must actually contain the expected variant, not merely a $0 cart shell.
+    # Legacy controlled-cart reconciliation remains conservative, but it is no
+    # longer a daily target. Do not confuse an empty cart shell with that SKU.
     if '/cart/51183558787357:1' in url:
         return bool(re.search(r'name=[\'"]id[\'"][^>]*value=[\'"]51183558787357', body))
     return True
 
 def discover(client):
-    urls, seen = [], set()
+    seen = set()
     for page in range(1, 21):
         if page > 1:
             time.sleep(5)  # Do not burst live storefront pagination requests.
@@ -710,15 +827,14 @@ def discover(client):
         if not paths:
             if page == 1:
                 raise LookupFailure('No products discovered')
-            return urls + [BASE + p for p in sorted(seen)]
+            return [BASE + p for p in sorted(seen)]
         if not paths - seen:
             raise LookupFailure('Catalog pagination repeats products')
-        urls.append(url)
         seen.update(paths)
         # Stop only on a page that has no link to a later collection page.
         linked = [int(n) for n in re.findall(r'[?&](?:amp;)?page=(\d+)', html.unescape(body))]
         if not any(n > page for n in linked):
-            return urls + [BASE + p for p in sorted(seen)]
+            return [BASE + p for p in sorted(seen)]
     raise LookupFailure('Catalog pagination exceeded limit')
 
 def discover_sitemap(client, max_sitemaps=32, max_depth=4, max_urls=5000):
@@ -800,6 +916,27 @@ def _number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value < 1e15
 
 
+def outlink_attempt_time(batch):
+    """Choose the first valid timestamp, without aging out a newer primary."""
+    if not isinstance(batch, dict):
+        return None
+    attempt = batch.get('attempt')
+    started = attempt.get('started_at') if isinstance(attempt, dict) else None
+    for value in (started, batch.get('utc_day'), batch.get('created_at')):
+        # The existing epoch domain also rejects NaN, infinity and huge ints
+        # without converting them to float (which could overflow).
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value < 1e15:
+            return value
+    return None
+
+
+def outlink_attempt_before_today(batch):
+    """A valid selected timestamp before today's UTC midnight is historical."""
+    started = outlink_attempt_time(batch)
+    today = dt.datetime.fromtimestamp(time.time(), UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    return started is not None and started < today
+
+
 def decode(raw):
     def pairs(items):
         result = {}
@@ -822,11 +959,17 @@ def validate_state(state):
         _reject('Empty state requires reviewed recovery; no initialization permitted')
     metadata = {'_queues', '_completed_jobs', '_outlink_batches', '_next_submit',
                 '_transport_cooldown_until', '_archive_next_request_at',
-                '_recovery_events', '_account_diagnostic'}
+                '_recovery_events', '_account_diagnostic', '_pause_responses'}
     for key, value in state.items():
         if key in ('_next_submit', '_transport_cooldown_until', '_archive_next_request_at'):
             if not _number(value):
                 _reject('Invalid persisted cooldown')
+        elif key == '_pause_responses':
+            if (not isinstance(value, dict) or not isinstance(value.get('run'), str)
+                    or not re.fullmatch(r'[0-9]+:[0-9]+', value['run'])
+                    or not isinstance(value.get('count'), int) or isinstance(value['count'], bool)
+                    or not 0 <= value['count'] <= 3):
+                _reject('Invalid persisted pause breaker')
         elif key == '_queues':
             if not isinstance(value, dict):
                 _reject('Invalid queue map')
@@ -839,8 +982,9 @@ def validate_state(state):
                         or not isinstance(queue.get('results'), list) or any(not isinstance(r, dict) for r in queue['results'])
                         or not isinstance(queue.get('complete'), bool)):
                     _reject('Invalid queue checkpoint')
-                if queue.get('started') is not None and (cursor >= len(urls) or queue['started'] != urls[cursor]):
-                    _reject('Inconsistent interrupted queue operation')
+                for marker in ('started', 'retry_same_url'):
+                    if queue.get(marker) is not None and (cursor >= len(urls) or queue[marker] != urls[cursor]):
+                        _reject('Inconsistent interrupted queue operation')
         elif key == '_outlink_batches':
             if not isinstance(value, dict):
                 _reject('Invalid outlink journal map')
@@ -862,8 +1006,13 @@ def validate_state(state):
                 if 'server_paused_until' in batch and not _number(batch['server_paused_until']):
                     _reject('Invalid outlink cooldown')
                 cursor = batch.get('verification_cursor')
+                day = batch.get('utc_day')
+                # Permit legacy date-field fallback, retaining the old zero-day
+                # sentinel as a protected hold when no valid date is available.
+                valid_date = outlink_attempt_time(batch) is not None or (
+                    isinstance(day, (int, float)) and not isinstance(day, bool) and day == 0)
                 if (not isinstance(cursor, int) or isinstance(cursor, bool) or not 0 <= cursor <= len(order)
-                        or not _number(batch.get('utc_day'))):
+                        or not valid_date):
                     _reject('Invalid outlink verification checkpoint')
         elif key in ('_completed_jobs', '_recovery_events'):
             if not isinstance(value, list) or any(not isinstance(v, dict) for v in value):
@@ -907,13 +1056,21 @@ class Runner:
         self.started = time.time()
         self.since = dt.datetime.fromtimestamp(self.started, UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         self.until = self.since + 86400 - 1
-        self.deadline, self.interval = self.started + budget, interval
+        self.deadline, self.interval = self.started + budget, max(60, interval)
         self.verify_only = verify_only
         self.poll_only = poll_only
         self.next_submit = self.state.get('_next_submit', 0)
         self.results = []
         self.transport_failure_streak = 0
         self.transport_circuit_open = False
+        run_key = os.environ.get('GITHUB_RUN_ID', '') + ':' + os.environ.get('GITHUB_RUN_ATTEMPT', '1')
+        self.run_key = run_key if re.fullmatch(r'[0-9]+:[0-9]+', run_key) else None
+        pauses = self.state.get('_pause_responses', {})
+        self.paused_responses = pauses.get('count', 0) if self.run_key and pauses.get('run') == self.run_key else 0
+        self.pause_circuit_open = self.paused_responses >= 3
+        self._spn_response_observed = False
+        self.client.archive_requests_stopped = self.pause_circuit_open
+        self.client.archive_response_callback = self.observe_archive_response
         self.client.post_retry_deadline = self.deadline
         self.client.post_utc_day_end = self.since + 86400
         self.client.archive_interval = 120
@@ -975,7 +1132,7 @@ class Runner:
         return row
 
     def result(self, url, state, include_pending=True, **extra):
-        row = {'url': url, 'state': state, **extra, **(self.diagnostic_snapshot(url) if include_pending else {})}
+        row = {'url': url, 'state': state, 'capture_timestamp': extra.get('timestamp') if state == 'verified' else None, **extra, **(self.diagnostic_snapshot(url) if include_pending else {})}
         self.results.append(row)
         print(json.dumps(row), flush=True)
         Path('capture-report.json').write_text(json.dumps(self.results, indent=2))
@@ -1010,28 +1167,83 @@ class Runner:
             return self.terminal_result(url, 'verified', **details)
         return self.result(url, 'verified', **details)
 
-    def pause(self, headers, obj):
-        detail = (str(obj.get('status_ext', '')) + ' ' + str(obj.get('message', ''))).lower()
-        paused = ('host-crawling-paused' in detail or 'crawling this host is paused' in detail
-                  or bool(re.search(r'http status\s*[=:]\s*429', detail)))
-        if not paused and obj.get('_http') != 429:
+    def observe_archive_response(self, url, code, headers, obj):
+        path = up.urlsplit(url).path
+        spn = path in ('/save', '/save/') or bool(re.fullmatch(r'/save/status/(?!system$|user$)[A-Za-z0-9_-]+', path))
+        self._spn_response_observed = spn
+        job_id = obj.get('job_id') if isinstance(obj, dict) else None
+        valid_job = isinstance(job_id, str) and re.fullmatch(r'[A-Za-z0-9_-]+', job_id)
+        paused = self.pause(headers, {**(obj if isinstance(obj, dict) else {}), '_http': code},
+                            observed=True, reset_streak=spn and isinstance(obj, dict)
+                            and (obj.get('status') in ('success', 'pending', 'error') or valid_job))
+        if paused:
+            self._operation_paused = True
+
+    def pause(self, headers, obj, observed=False, reset_streak=True):
+        detail = response_metadata(obj.get('_http'), headers, obj)
+        if not observed and self._spn_response_observed:
+            self._spn_response_observed = False
+            return bool(detail['pause_triggers'])  # Physical response already counted.
+        if not detail['pause_triggers']:
+            if not reset_streak:
+                return False
+            self.paused_responses = 0  # Only a nonpaused SPN response resets this.
+            if self.run_key:
+                self.state['_pause_responses'] = {'run': self.run_key, 'count': 0}
+                self.save()
             return False
-        retry = headers.get('retry-after', '660')
-        try:
-            seconds = int(retry)
-        except ValueError:
-            from email.utils import parsedate_to_datetime
-            try:
-                seconds = int(parsedate_to_datetime(retry).timestamp() - time.time())
-            except (ValueError, TypeError):
-                seconds = 660
-        self.next_submit = time.time() + max(660, seconds)
+        self.paused_responses = min(3, self.paused_responses + 1)
+        if self.run_key:
+            self.state['_pause_responses'] = {'run': self.run_key, 'count': self.paused_responses}
+        self.pause_circuit_open = self.paused_responses >= 3
+        self.client.archive_requests_stopped = self.pause_circuit_open
+        self.next_submit = max(time.time() + 1200, detail.get('retry_after_until', 0),
+            self.next_submit, self.state.get('_next_submit', 0),
+            self.state.get('_archive_next_request_at', 0), self.client.archive_next_request_at,
+            self.state.get('_transport_cooldown_until', 0))
         self.state['_next_submit'] = self.next_submit
-        # A known server pause is stronger than the local global floor.
-        self.client.archive_next_request_at = max(self.state.get('_archive_next_request_at', 0), self.next_submit)
-        self.state['_archive_next_request_at'] = self.client.archive_next_request_at
+        self.client.archive_next_request_at = self.next_submit
+        self.state['_archive_next_request_at'] = self.next_submit
+        queue = getattr(self, 'active_queue', None)
+        if queue and queue.get('started') is not None:
+            queue['retry_same_url'] = queue['started']
         self.save()
         return True
+
+    def product_attempted_today(self, url):
+        # Reuse the append-only request journal, including pre-policy failures.
+        # Reservation is saved before I/O, so an interrupted attempt also counts.
+        records = [self.state.get(url, {})] + [row for row in self.state.get('_completed_jobs', []) if row.get('url') == url]
+        for row in records:
+            request = row.get('request_evidence', {})
+            if not isinstance(request, dict):
+                raise LookupFailure('Malformed product request history; no submission')
+            attempts = request.get('attempts', [])
+            if row.get('state') == 'budget_not_submitted' and not attempts:
+                continue
+            if (not isinstance(attempts, list) or any(not isinstance(a, dict) or not _number(a.get('started_at')) for a in attempts)
+                    or ('submitted_at' in row and not _number(row['submitted_at']))):
+                raise LookupFailure('Malformed product attempt history; no submission')
+            times = [row.get('submitted_at')] + [a.get('started_at') for a in attempts if isinstance(a, dict)]
+            if any(isinstance(t, (int, float)) and not isinstance(t, bool) and self.since <= t < self.since + 86400 for t in times):
+                return True
+        for batch in self.state.get('_outlink_batches', {}).values():
+            if outlink_attempt_before_today(batch):
+                continue
+            mapped = any(child.get('job_ids') and (child.get('url') == url
+                         or child.get('url_sha256') == hashlib.sha256(url.encode()).hexdigest())
+                         for child in batch.get('children', {}).values())
+            if not mapped:
+                continue
+            started = outlink_attempt_time(batch)
+            if started is None:
+                raise LookupFailure('Malformed outlink attempt history; no submission')
+            today = dt.datetime.fromtimestamp(time.time(), UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            if started >= today + 86400:
+                raise LookupFailure('Future outlink attempt history; no submission')
+            if today <= started:
+                return True
+        return False
 
     def classify_success(self, url, pending, check_daily=True):
         """Resolve a completed job using archive evidence, never status alone."""
@@ -1070,12 +1282,17 @@ class Runner:
         # A per-run circuit counts URL operations with exhausted Archive
         # transport failures; successful intermediate CDX reads cannot erase a
         # subsequent failed POST/status lookup for the same URL.
+        if self.pause_circuit_open:
+            return self.result(url, 'deferred', reason='three consecutive paused Archive responses; run stopped', queue_untouched=True)
         if self.transport_circuit_open or self.state.get('_transport_cooldown_until', 0) > time.time():
             return self.result(url, 'deferred', reason='local transport circuit cooldown; no network requests made', queue_untouched=True)
         before_failed = getattr(self.client, 'archive_transport_failures', 0)
         before_healthy = getattr(self.client, 'archive_healthy_responses', 0)
         self._operation_transport_failed = False
+        self._operation_paused = False
         row = self._process(url)
+        if self._operation_paused and row.get('state') != 'verified':
+            row['retry_same_url'] = True
         after_failed = getattr(self.client, 'archive_transport_failures', 0)
         after_healthy = getattr(self.client, 'archive_healthy_responses', 0)
         failed = self._operation_transport_failed or (isinstance(before_failed, int) and isinstance(after_failed, int) and after_failed > before_failed)
@@ -1158,26 +1375,46 @@ class Runner:
         """Checkpoint untouched work; a cursor is never a coverage claim."""
         mode = 'verify' if self.verify_only else 'poll' if self.poll_only else 'capture'
         key = scope + ':' + timestamp(self.since)[:8] + ':' + mode
+        if scope in ('all', 'priority'):
+            key += ':daily-v2'  # Old order, removed targets and weaker evidence stay history only.
         queues = self.state.setdefault('_queues', {})
         # Keep old checkpoints as evidence, without changing the daily scheduler.
         queue = queues.get(key)
-        if not queue or queue.get('complete'):
-            queue = {'urls': list(dict.fromkeys(urls)), 'cursor': 0,
-                     'results': [], 'complete': False}
+        revisit_priority = scope == 'priority' and queue and (queue['cursor'] > 0 or queue.get('started') is not None)
+        if not queue or queue.get('complete') or revisit_priority:
+            retry_url = queue.get('retry_same_url') if queue else None
+            verified = [r for r in queue['results'] if r.get('state') == 'verified'
+                        and str(r.get('timestamp', '')).startswith(timestamp(self.since)[:8])] if queue and scope == 'priority' else []
+            if queue:
+                history_key = key + ':pass:' + str(len(queues))
+                while history_key in queues:
+                    history_key += '0'
+                queues[history_key] = queue
+            covered = {r['url'] for r in verified}
+            remaining = [u for u in dict.fromkeys(urls) if u not in covered]
+            if retry_url in remaining:
+                remaining.remove(retry_url)
+                remaining.insert(0, retry_url)
+            queue = {'urls': remaining, 'cursor': 0,
+                     'results': verified, 'complete': False}
             queues[key] = queue
         self.results.extend(queue['results'])
+        for row in queue['results']:
+            print(json.dumps(row), flush=True)
+        Path('capture-report.json').write_text(json.dumps(self.results, indent=2))
         # Save before dispatch. A crash after start cannot lead to a blind
         # replay of a possibly sent submission, even without a job ID.
-        if queue.get('started') is not None:
+        if queue.get('started') is not None and queue.get('retry_same_url') != queue['started']:
             url = queue['urls'][queue['cursor']]
             self.result(url, 'unverified', reason='interrupted URL operation; resume skips it, pending state preserved')
-            queue['results'] = list(self.results)
+            queue['results'] = [r for r in self.results if r.get('url') in queue['urls'] or (scope == 'priority' and r.get('url') in {BASE + p for p in PRIORITY})]
             queue['cursor'] += 1
             queue.pop('started', None)
+        queue.pop('started', None)
         self.save()
         cycles = 0
         while queue['cursor'] < len(queue['urls']):
-            if time.time() + 120 >= self.deadline:
+            if self.pause_circuit_open or time.time() + 120 >= self.deadline:
                 break
             if self.transport_circuit_open or '_transport_cooldown_until' in self.state:
                 if cycles >= 2:
@@ -1190,11 +1427,16 @@ class Runner:
             url = queue['urls'][queue['cursor']]
             queue['started'] = url
             self.save()
+            row = None
             if scope == 'supplemental' and url == BASE + '/agents.md':
                 self.result(url, 'unsupported-document-type', content_type='text/markdown',
                             reason='published text document is outside the HTML verifier; no submission made')
             else:
-                row = self.process(url)
+                self.active_queue = queue
+                try:
+                    row = self.process(url)
+                finally:
+                    self.active_queue = None
                 if isinstance(row, dict) and row.get('queue_untouched') is True:
                     # No completed operation: retain this untouched cursor.
                     # Its transient report is not checkpointed as processed.
@@ -1202,21 +1444,33 @@ class Runner:
                     queue.pop('started', None)
                     self.save()
                     break
+            if isinstance(row, dict) and row.get('retry_same_url'):
+                queue.pop('started', None)
+                queue['results'] = [r for r in self.results if r.get('url') in queue['urls'] or (scope == 'priority' and r.get('url') in {BASE + p for p in PRIORITY})]
+                self.save()
+                delay = max(0, self.next_submit - time.time(), self.client.archive_next_request_at - time.time())
+                if self.pause_circuit_open or time.time() + delay + 120 >= self.deadline:
+                    break
+                time.sleep(delay)
+                continue  # Reconcile/retry this URL before advancing the queue.
             queue['cursor'] += 1
             queue.pop('started', None)
-            queue['results'] = list(self.results)
+            queue.pop('retry_same_url', None)
+            queue['results'] = [r for r in self.results if r.get('url') in queue['urls'] or (scope == 'priority' and r.get('url') in {BASE + p for p in PRIORITY})]
             self.save()
         queue['complete'] = queue['cursor'] == len(queue['urls'])
         self.save()
         # These reporting rows do not advance the saved cursor/results.
         for url in queue['urls'][queue['cursor']:]:
-            self.result(url, 'deferred', reason='untouched queue checkpoint saved; recovery cycles or run budget exhausted')
+            self.result(url, 'deferred', reason='three consecutive paused Archive responses; not captured' if self.pause_circuit_open else 'untouched queue checkpoint saved; recovery cycles or run budget exhausted')
 
     def outlink_submission_hold(self, url):
         journals = self.state.get('_outlink_batches', {})
         if not isinstance(journals, dict):
             return 'outlink journal needs review; no direct submission'
         for batch in journals.values():
+            if outlink_attempt_before_today(batch):
+                continue
             if not isinstance(batch, dict):
                 return 'outlink journal needs review; no direct submission'
             if (batch.get('post_state') not in ('not_dispatched', 'not_dispatched_budget', 'not_sent_proven',
@@ -1555,6 +1809,8 @@ class Runner:
             if not pending and self.poll_only:
                 return self.result(url, 'unverified', reason='no saved job to poll; no submission made')
             if not pending:
+                if is_product(url) and self.product_attempted_today(url):
+                    return self.result(url, 'deferred', reason='product already attempted this UTC day; no second submission')
                 if time.time() >= self.since + 86400:
                     return self.result(url, 'deferred', reason='intended UTC day ended; no new submission')
                 # An unknown outlink expansion forbids a new POST, but must not
@@ -1579,6 +1835,7 @@ class Runner:
                 self.state['_next_submit'] = self.next_submit = time.time() + self.interval
                 self.save()
                 self.client.post_retry_not_before = self.next_submit
+                self.client.post_retry_deadline = 0 if is_product(url) else self.deadline
                 def record_attempt(attempt):
                     pending['request_evidence'].setdefault('attempts', []).append(attempt)
                     # Pace the next URL from the latest physical attempt, not
@@ -1605,8 +1862,10 @@ class Runner:
                     if pending.get('job_id'):
                         pending['status_paused_until'] = self.next_submit
                         self.save()
-                        return self.result(url, 'deferred', reason='submission paused but job accepted; retained')
-                    return self.terminal_result(url, 'deferred', reason='host crawling paused', response=pending['submission_response'])
+                        return self.result(url, 'deferred', reason='submission paused but job accepted; retained', retry_same_url=True)
+                    if obj.get('status') == 'error' or status == 429:
+                        return self.terminal_result(url, 'deferred', reason='host crawling paused', response=pending['submission_response'], retry_same_url=True)
+                    return self.result(url, 'pending', reason='paused response has uncertain acceptance; no duplicate submission', retry_same_url=True)
                 if not isinstance(job_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', job_id):
                     if obj.get('status') == 'error' or status in (400, 401, 403):
                         return self.terminal_failure(url, reason='submission explicitly rejected', http_status=status,
@@ -1646,7 +1905,7 @@ class Runner:
                     # capture was refused. Keep its job to prevent a duplicate.
                     pending['status_paused_until'] = self.next_submit
                     self.save()
-                    return self.result(url, 'deferred', reason='status lookup paused; existing job retained', response=response_metadata(status, headers, obj))
+                    return self.result(url, 'deferred', reason='status lookup paused; existing job retained', response=response_metadata(status, headers, obj), retry_same_url=True)
                 if status in (404, 410):
                     pending['review_required'] = True
                     pending['status_lookup_http'] = status
@@ -1721,6 +1980,20 @@ class Runner:
                 return self.result(url, 'unverified', reason='Archive transport failed', transport=detail)
             return self.result(url, 'unverified', reason=str(exc))
 
+def daily_summary(urls, results, since, inventory_complete=True):
+    day = timestamp(since)[:8]
+    verified = {row['url'] for row in results if row.get('state') == 'verified'
+                and isinstance(row.get('timestamp'), str)
+                and re.fullmatch(day + r'[0-9]{6}', row['timestamp'])}
+    missing = [path for path in PRIORITY if BASE + path not in verified]
+    products = {url for url in urls if is_product(url)}
+    product_count = ('not assessed (priority-only scope)' if inventory_complete is None else
+                     str(len(products - verified)) if inventory_complete else 'unknown (catalog discovery incomplete)')
+    names = ['Home (/)' if path == '/' else path for path in missing]
+    return ('Tier 1 pages with no verified capture: ' + (', '.join(names) if names else 'none')
+            + '\nProducts with no verified capture: ' + product_count + '\n'), missing
+
+
 def main():
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group()
@@ -1777,20 +2050,33 @@ def main():
                 runner.result(BASE + '/sitemap.xml', 'no-additional-targets', reason='published sitemap is fully covered by existing all-scope inventory')
         except LookupFailure as exc:
             runner.result(BASE + '/sitemap.xml', 'discovery-incomplete', reason=str(exc))
+    inventory_complete = True
     if args.scope == 'all':
         try:
             urls.extend(discover(client))
         except LookupFailure as exc:
+            inventory_complete = False
             runner.result(BASE + '/collections/all', 'discovery-incomplete', reason=str(exc))
     if args.scope == 'supplemental_probe':
         runner.run_supplemental_probe()
+    elif args.scope == 'all':
+        # Revisit unresolved tier 1 on every scheduled pass before resuming the
+        # product checkpoint; earlier strict same-day evidence remains valid.
+        runner.run_queue([BASE + p for p in PRIORITY], 'priority')
+        runner.run_queue([url for url in urls if is_product(url)], 'all')
     else:
         runner.run_queue(urls, args.scope)
     counts = {state: sum(r['state'] == state for r in runner.results) for state in sorted({r['state'] for r in runner.results})}
     summary = 'UTC date: %s\n\nResults: %s\n\nFull per-URL evidence is in capture-report.json.\n' % (timestamp(runner.since)[:8], json.dumps(counts))
+    missing_priority = []
+    if args.scope in ('all', 'priority'):
+        coverage, missing_priority = daily_summary(urls, runner.results, runner.since, inventory_complete if args.scope == 'all' else None)
+        summary += coverage
     print(summary)
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         Path(os.environ['GITHUB_STEP_SUMMARY']).write_text(summary)
+    if args.scope in ('all', 'priority'):
+        return 1 if missing_priority or not inventory_complete else 0
     return 0 if runner.results and all(r['state'] in ('verified', 'no-additional-targets') for r in runner.results) else 1
 
 if __name__ == '__main__':

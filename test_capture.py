@@ -423,19 +423,19 @@ class RunnerTests(unittest.TestCase):
             main()
         self.assertEqual(path.read_text(), 'real summary')
 
-    def test_pilot_main_host_pause_has_one_submission_only(self):
+    def test_pilot_main_host_pause_stops_after_three_responses(self):
         from capture import main
         self.c.json.return_value = (429, {'retry-after': '660'},
                                     {'status_ext': 'error:host-crawling-paused'})
         with patch('sys.argv', ['capture.py', '--scope', 'pilot']), patch('capture.Client', return_value=self.c):
             self.assertEqual(main(), 1)
-        self.assertEqual(self.c.json.call_count, 1)
-        self.assertEqual(self.c.verify.call_count, 1)
+        self.assertEqual(self.c.json.call_count, 3)
+        self.assertEqual(self.c.verify.call_count, 3)
         self.assertEqual(self.c.json.call_args.args[0], 'https://web.archive.org/save/')
         saved = json.loads(Path('.capture-state/pending.json').read_text())
-        self.assertGreater(saved['_next_submit'], time.time() + 659)
+        self.assertGreater(saved['_next_submit'], time.time() + 1199)
         report = json.loads(Path('capture-report.json').read_text())
-        self.assertEqual(len(report), 1)
+        self.assertEqual(len(report), 4)
         self.assertEqual(report[0]['state'], 'deferred')
 
     def old_success_state(self):
@@ -582,7 +582,7 @@ class RunnerTests(unittest.TestCase):
         page2 = GOOD + '<link rel="canonical" href="' + BASE + '/collections/all?page=2"><a href="/products/second">Second</a>'
         self.c.request.side_effect = [(200, {}, page1, BASE + '/collections/all'),
                                      (200, {}, page2, BASE + '/collections/all?page=2')]
-        self.assertEqual(discover(self.c), [BASE + '/collections/all', BASE + '/collections/all?page=2',
+        self.assertEqual(discover(self.c), [
                                           BASE + '/products/first', BASE + '/products/second'])
 
     def test_catalog_page_two_wrong_final_query_rejected(self):
@@ -1000,7 +1000,7 @@ class ResumableQueueTests(unittest.TestCase):
         self.r.process.assert_not_called()
         self.assertGreaterEqual(self.r.state['_transport_cooldown_until'], self.now + 7200)
     def test_crash_marker_skipped_pending_untouched(self):
-        key = 'all:' + timestamp(self.r.since)[:8] + ':capture'
+        key = 'all:' + timestamp(self.r.since)[:8] + ':capture:daily-v2'
         unknown = {'submitted_at': self.now - 100, 'job_id': None}
         self.r.state[self.urls[0]] = dict(unknown)
         self.r.state['_queues'] = {key: {'urls': self.urls, 'cursor': 0, 'results': [], 'complete': False, 'started': self.urls[0]}}
@@ -1894,7 +1894,7 @@ class PauseMetadataTests(unittest.TestCase):
             self.assertNotIn('response_age_seconds', result)
             self.assertNotIn('SECRET', json.dumps(result))
 
-    def test_observation_tracks_unchanged_pause_predicate(self):
+    def test_observation_tracks_pause_predicate(self):
         from capture import response_metadata
         import re
         cases = [{'message': 'HTTP status=4299'}, {'status_ext': ['host-crawling-paused']},
@@ -1902,8 +1902,960 @@ class PauseMetadataTests(unittest.TestCase):
         for obj in cases:
             detail = (str(obj.get('status_ext', '')) + ' ' + str(obj.get('message', ''))).lower()
             expected = ('host-crawling-paused' in detail or 'crawling this host is paused' in detail
-                        or bool(re.search(r'http status\s*[=:]\s*429', detail)))
+                        or 'overloaded' in detail or bool(re.search(r'http status\s*[=:]\s*429\b', detail)))
             self.assertEqual(bool(response_metadata(200, {}, obj)['pause_triggers']), expected)
+
+
+class DailyPolicyEvidenceTests(unittest.TestCase):
+    """Only synthetic CDX/replay responses; never invoke a live endpoint."""
+    product = BASE + '/products/ice-blue-watch'
+    name = 'Ice Blue Watch'
+    now = 1793793600.0  # 2026-11-04 12:00 UTC
+
+    def product_html(self, changes=None, heading=None, title=None, extra=''):
+        node = {'@type': 'Product', '@id': self.product + '#product', 'url': self.product,
+                'name': self.name, 'offers': {'@type': 'Offer', 'price': '339.99',
+                'priceCurrency': 'USD', 'url': self.product + '?variant=123'}}
+        node.update(changes or {})
+        return ('<html><head><title>' + (title or self.name + ' – Somerville Watch Co.')
+                + '</title><script type="application/ld+json">' + json.dumps({'@graph': [node]})
+                + '</script></head><body><h1>' + (heading or self.name) + '</h1>'
+                + 'Product details ' * 50 + extra + '</body></html>')
+
+    def archive(self, url, body, original=None, replay=None, code='200', replay_code=200, ts=None):
+        from capture import epoch
+        ts = ts or timestamp(self.now - 60)
+        client = Client()
+        client.json = Mock(return_value=(200, {}, [FIELDS, [ts, original or url, code, 'text/html', 'digest']]))
+        client.request = Mock(return_value=(replay_code, {'Content-Type': 'text/html'}, body,
+            replay or 'https://web.archive.org/web/' + ts + 'id_/' + url))
+        with patch('capture.time.time', return_value=self.now):
+            result = client.verify(url, epoch('20261104000000'), until=epoch('20261104235959'))
+        return result, client
+
+    def test_product_metadata_title_heading_and_offer_match(self):
+        self.assertIsNotNone(self.archive(self.product, self.product_html())[0])
+        self.assertTrue(usable_html(self.product_html({'@id': self.product}), self.product))
+
+    def test_exact_product_name_must_match_title_and_heading(self):
+        for body in (self.product_html(title='Another Watch – Somerville Watch Co.'),
+                     self.product_html(heading='Another Watch'),
+                     self.product_html({'name': 'Another Watch'}),
+                     self.product_html({'name': 'Somerville Watch Co.'}, heading='Somerville Watch Co.')):
+            with self.subTest(body=body[:80]):
+                self.assertFalse(usable_html(body, self.product))
+
+    def test_cart_or_recommendation_price_is_not_product_price(self):
+        for changes in ({'offers': []}, {'offers': {'price': '0', 'priceCurrency': 'USD'}},
+                        {'url': BASE + '/products/another-watch'},
+                        {'offers': {'price': '339.99', 'priceCurrency': 'USD', 'url': BASE + '/products/another-watch'}},
+                        {'@id': self.product + '?variant=999#product'}, {'@type': 'BreadcrumbList'}):
+            with self.subTest(changes=changes):
+                self.assertFalse(usable_html(self.product_html(changes, extra='<nav>Cart $99.00</nav>'), self.product))
+
+    def test_malformed_prices_or_currency_fail_closed(self):
+        for price in (None, True, 'NaN', 'Infinity', '-1', '0', '$339.99', '1e6', {}, []):
+            with self.subTest(price=price):
+                self.assertFalse(usable_html(self.product_html({'offers': {'price': price, 'priceCurrency': 'USD'}}), self.product))
+        self.assertFalse(usable_html(self.product_html({'offers': {'price': '339.99'}}), self.product))
+
+    def test_fake_document_titles_and_headings_do_not_count(self):
+        fake = '<title>Somerville Watch Co.</title>'
+        for wrapper in ('<!-- %s -->', '<script>%s</script>', '<template>%s</template>', '<style>%s</style>', '<svg>%s</svg>', '<noscript>%s</noscript>'):
+            body = GOOD.replace('<title>Somerville Watch Co.</title>', '<title>Unrelated Store</title>' + wrapper % fake)
+            self.assertFalse(usable_html(body, URL))
+        body = self.product_html().replace('<h1>Ice Blue Watch</h1>', '<template><h1>Ice Blue Watch</h1></template>')
+        self.assertFalse(usable_html(body, self.product))
+        body = self.product_html().replace('<script type="application/ld+json">', '<template><script type="application/ld+json">').replace('</script>', '</script></template>')
+        self.assertFalse(usable_html(body, self.product))
+
+    def test_brand_required_in_actual_title(self):
+        self.assertFalse(usable_html(GOOD.replace('<title>Somerville Watch Co.</title>', '<title>Watch shop</title>'), URL))
+        self.assertFalse(usable_html(self.product_html(title=self.name), self.product))
+        self.assertFalse(usable_html(GOOD + '<title>Somerville Watch Co.</title>', URL))
+
+    def test_cdx_exact_url_rejects_normalized_aliases(self):
+        for original in ('http://somervillewatchco.com/', 'https://www.somervillewatchco.com/', BASE,
+                         BASE + '/?utm_source=x'):
+            with self.subTest(original=original):
+                evidence, client = self.archive(URL, GOOD, original=original)
+                self.assertIsNone(evidence)
+                client.request.assert_not_called()
+        target = BASE + '/cart?a=1&b=2'
+        self.assertIsNone(self.archive(target, GOOD, original=BASE + '/cart?b=2&a=1')[0])
+
+    def test_replay_must_be_exact_id_timestamp_and_url(self):
+        prefix = 'https://web.archive.org/web/' + timestamp(self.now - 60)
+        for replay in (prefix + '/' + URL, prefix + 'id_/http://somervillewatchco.com/',
+                       prefix.replace('https:', 'http:') + 'id_/' + URL,
+                       'https://web.archive.org/web/' + timestamp(self.now - 120) + 'id_/' + URL):
+            with self.subTest(replay=replay):
+                self.assertIsNone(self.archive(URL, GOOD, replay=replay)[0])
+
+    def test_any_2xx_requires_valid_html(self):
+        for code in ('200', '201', '202', '203', '206', '299'):
+            self.assertIsNotNone(self.archive(URL, GOOD, code=code, replay_code=int(code))[0])
+        for code in ('301', '404', '429', '500'):
+            self.assertIsNone(self.archive(URL, GOOD, code=code)[0])
+        self.assertIsNone(self.archive(URL, '', code='204', replay_code=204)[0])
+
+    def test_prior_day_within_twenty_hours_never_daily_success(self):
+        evidence, client = self.archive(URL, GOOD, ts='20261103235959')
+        self.assertIsNone(evidence)
+        client.request.assert_not_called()
+        self.assertIn('from=20261104&', client.json.call_args.args[0])
+
+    def test_summary_counts_current_verified_evidence_only(self):
+        from capture import PRIORITY, daily_summary, epoch
+        urls = [BASE + p for p in PRIORITY] + [self.product, BASE + '/products/other']
+        rows = [{'url': url, 'state': 'verified', 'timestamp': '20261104115900'} for url in urls]
+        text, missing = daily_summary(urls, rows, epoch('20261104000000'))
+        self.assertEqual(missing, [])
+        self.assertIn('Products with no verified capture: 0', text)
+        rows[0]['timestamp'] = '20261103235959'
+        rows[-1]['state'] = 'success'
+        text, missing = daily_summary(urls, rows, epoch('20261104000000'))
+        self.assertEqual(missing, ['/'])
+        self.assertIn('Products with no verified capture: 1', text)
+        self.assertIn('Home (/)', text)
+        text, _ = daily_summary(urls, rows, epoch('20261104000000'), False)
+        self.assertIn('unknown (catalog discovery incomplete)', text)
+
+
+class DailyPolicyRunnerTests(unittest.TestCase):
+    """Real orchestration with a fake clock and fully stubbed network transport."""
+    product = BASE + '/products/ice-blue-watch'
+
+    def setUp(self):
+        from capture import epoch
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        old = os.getcwd(); os.chdir(self.tmp.name); self.addCleanup(os.chdir, old)
+        self.now = epoch('20261104120000')
+        self.clock = patch('capture.time.time', side_effect=lambda: self.now); self.clock.start(); self.addCleanup(self.clock.stop)
+        self.sleeper = patch('capture.time.sleep', side_effect=self.advance); self.sleeper.start(); self.addCleanup(self.sleeper.stop)
+        self.env = patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': '', 'GITHUB_RUN_ID': '12345', 'GITHUB_RUN_ATTEMPT': '1'})
+        self.env.start(); self.addCleanup(self.env.stop)
+        seed_test_state('state.json'); seed_test_state('.capture-state/pending.json')
+        self.calls = []
+        self.post_response = (401, {}, {'status': 'error'})
+        self.status_response = (200, {}, {'status': 'pending'})
+        self.c = Client(); self.c._request = Mock(side_effect=self.request)
+        self.r = Runner(self.c, 'state.json', budget=20000)
+
+    def advance(self, seconds):
+        self.assertGreaterEqual(seconds, 0)
+        self.now += seconds
+
+    def request(self, url, data=None, authenticated=False):
+        self.calls.append((url, data, self.now))
+        if data is not None:
+            saved = json.loads(Path(self.r.state_path).read_text())
+            self.assertIn(data['url'], saved)
+            self.assertEqual(saved[data['url']]['request_evidence']['attempts'][-1]['started_at'], self.now)
+            response = self.post_response(data['url']) if callable(self.post_response) else self.post_response
+        elif '/save/status/' in url:
+            response = self.status_response
+        else:
+            response = (200, {}, [])
+        status, headers, body = response
+        return status, headers, body if isinstance(body, str) else json.dumps(body), url
+
+    def posts(self):
+        return [(data['url'], at) for _, data, at in self.calls if data is not None]
+
+    def restart(self, budget=20000):
+        self.r = Runner(self.c, 'state.json', budget=budget)
+        return self.r
+
+    def test_priority_exact_requested_order(self):
+        from capture import PRIORITY
+        self.assertEqual(PRIORITY, ['/', '/policies/refund-policy', '/policies/shipping-policy',
+            '/policies/terms-of-service', '/policies/privacy-policy', '/policies/contact-information',
+            '/policies/legal-notice', '/pages/contact', '/pages/warranty-policy',
+            '/pages/no-brand-affiliation', '/policies/subscription-policy', '/cart'])
+
+    def test_same_day_rejected_product_only_one_post_and_next_day_allowed(self):
+        self.assertEqual(self.r.process(self.product)['state'], 'failed')
+        self.assertEqual(self.restart().process(self.product)['state'], 'deferred')
+        self.assertEqual(len(self.posts()), 1)
+        self.now += 86400
+        self.assertEqual(self.restart().process(self.product)['state'], 'failed')
+        self.assertEqual(len(self.posts()), 2)
+
+    def test_all_legacy_attempt_times_count_not_only_latest(self):
+        self.r.state['_completed_jobs'] = [{'url': self.product, 'state': 'failed',
+            'submitted_at': self.now - 86400, 'request_evidence': {'attempts': [
+                {'started_at': self.now - 10}, {'started_at': self.now - 86400}]}}]
+        self.r.save()
+        self.assertEqual(self.restart().process(self.product)['state'], 'deferred')
+        self.assertEqual(self.posts(), [])
+
+    def test_known_not_sent_product_not_retried_same_day(self):
+        original = self.c._request.side_effect
+        def transport(url, data=None, authenticated=False):
+            if data is not None:
+                self.calls.append((url, data, self.now))
+                raise LookupFailure('connect failed', transport={'phase': 'tcp_connect', 'known_not_sent': True})
+            return original(url, data, authenticated)
+        self.c._request.side_effect = transport
+        self.assertEqual(self.r.process(self.product)['state'], 'unverified')
+        self.assertEqual(len(self.posts()), 1)
+        self.assertTrue(self.r.state[self.product]['known_not_sent'])
+        self.assertEqual(self.restart().process(self.product)['state'], 'deferred')
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_uncertain_product_preserved_across_day_and_restart(self):
+        self.post_response = (200, {}, {})
+        self.assertEqual(self.r.process(self.product)['state'], 'pending')
+        saved = dict(self.r.state[self.product])
+        self.now += 86400
+        self.assertEqual(self.restart().process(self.product)['state'], 'pending')
+        self.assertEqual(self.r.state[self.product], saved)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_budget_reservation_without_attempt_does_not_use_product_day(self):
+        self.r.state['_completed_jobs'] = [{'url': self.product, 'state': 'budget_not_submitted',
+            'submitted_at': self.now, 'request_evidence': {}}]
+        self.r.save()
+        self.assertEqual(self.r.process(self.product)['state'], 'failed')
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_reused_product_same_day_still_capped_after_retirement(self):
+        self.r.state[self.product] = {'submitted_at': self.now - 100, 'job_id': 'old',
+            'terminal_reused': {'timestamp': '20261103235959'}, 'retry_eligible_at': self.now - 1}
+        self.r.save()
+        self.assertEqual(self.r.process(self.product)['state'], 'deferred')
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(self.r.state['_completed_jobs'][-1]['state'], 'reused_released')
+
+    def test_paused_product_rechecks_without_second_post(self):
+        self.post_response = (429, {}, {'status': 'error'})
+        self.r.run_queue([self.product], 'all')
+        self.assertEqual(len(self.posts()), 1)
+        self.assertGreaterEqual(self.now - self.posts()[0][1], 1200)
+        self.assertIn('product already attempted', self.r.results[-1]['reason'])
+
+    def test_three_pauses_retry_same_tier_one_and_stop_immediately(self):
+        self.post_response = (429, {}, {'status': 'error'})
+        self.r.run_queue([URL, BASE + '/cart'], 'all')
+        posts = self.posts()
+        self.assertEqual([url for url, _ in posts], [URL] * 3)
+        self.assertTrue(all(b[1] - a[1] >= 1200 for a, b in zip(posts, posts[1:])))
+        self.assertEqual(self.now, posts[-1][1])
+        self.assertTrue(self.r.pause_circuit_open)
+        self.assertGreaterEqual(self.r.state['_next_submit'], self.now + 1200)
+        self.assertTrue(all(row['capture_timestamp'] is None for row in self.r.results))
+        self.assertEqual(self.r.results[-1]['url'], BASE + '/cart')
+        self.assertEqual(self.r.state['_pause_responses']['count'], 3)
+
+    def test_pause_breaker_survives_same_run_restart_but_not_new_run(self):
+        self.post_response = (429, {}, {'status': 'error'})
+        self.r.run_queue([URL], 'all')
+        self.restart().run_queue([URL], 'all')
+        self.assertEqual(len(self.posts()), 3)
+        os.environ['GITHUB_RUN_ID'] = '12346'
+        self.post_response = (401, {}, {'status': 'error'})
+        gate = self.r.state['_next_submit']
+        self.restart().run_queue([URL], 'all')
+        self.assertEqual(len(self.posts()), 4)
+        self.assertGreaterEqual(self.posts()[-1][1], gate)
+
+    def test_short_budget_keeps_same_url_pause_cursor(self):
+        self.post_response = (429, {}, {'status': 'error'})
+        self.r.deadline = self.c.archive_deadline = self.now + 1000
+        self.r.run_queue([URL, BASE + '/cart'], 'all')
+        queue = self.r.state['_queues']['all:20261104:capture:daily-v2']
+        self.assertEqual(queue['cursor'], 0)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual(self.restart().paused_responses, 1)
+        self.r.run_queue([URL, BASE + '/cart'], 'all')
+        self.assertEqual([u for u, _ in self.posts()], [URL] * 3)
+
+    def test_accepted_paused_jobs_only_poll_never_resubmit(self):
+        self.post_response = (200, {}, {'job_id': 'accepted-job'})
+        self.status_response = (429, {}, {'status': 'error', 'message': 'overloaded'})
+        self.r.run_queue([URL, BASE + '/cart'], 'all')
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual(self.r.state[URL]['job_id'], 'accepted-job')
+        statuses = [u for u, data, _ in self.calls if '/save/status/' in u]
+        self.assertEqual(len(statuses), 3)
+        self.assertTrue(self.r.pause_circuit_open)
+
+    def test_paused_accepted_submission_counted_once(self):
+        self.post_response = (429, {}, {'job_id': 'accepted-job', 'status': 'error'})
+        self.status_response = (429, {}, {'status': 'error'})
+        self.r.run_queue([URL], 'all')
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual(len([u for u, _, _ in self.calls if '/save/status/' in u]), 2)
+        self.assertEqual(self.r.paused_responses, 3)
+
+    def test_non_json_overload_keeps_unknown_acceptance(self):
+        self.post_response = (200, {}, 'Server overloaded, try later')
+        self.r.run_queue([URL], 'all')
+        self.assertEqual(len(self.posts()), 1)
+        self.assertIn(URL, self.r.state)
+        self.assertIsNone(self.r.state[URL]['job_id'])
+        self.assertGreaterEqual(self.now - self.posts()[0][1], 1200)
+
+    def test_longer_retry_after_and_saved_global_gate_are_preserved(self):
+        from email.utils import formatdate
+        gate = self.now + 7200
+        self.r.state['_archive_next_request_at'] = gate
+        self.r.state['_next_submit'] = gate
+        self.r.next_submit = self.c.archive_next_request_at = gate
+        self.r.save()
+        self.r.pause({'retry-after': formatdate(self.now + 3600, usegmt=True)}, {'_http': 429})
+        self.assertEqual(self.r.next_submit, gate)
+        self.r.pause({'retry-after': '10800'}, {'message': 'overloaded'})
+        self.assertEqual(self.r.next_submit, self.now + 10800)
+
+    def test_nonpaused_spn_resets_streak_but_healthy_cdx_does_not(self):
+        self.r.observe_archive_response('https://web.archive.org/cdx/search/cdx', 429, {}, {})
+        self.r.observe_archive_response('https://web.archive.org/cdx/search/cdx', 200, {}, [])
+        self.assertEqual(self.r.paused_responses, 1)
+        self.r.observe_archive_response('https://web.archive.org/save/status/job', 200, {}, {'status': 'pending'})
+        self.assertEqual(self.r.paused_responses, 0)
+
+    def test_cdx_429_get_retry_waits_twenty_minutes_before_any_post(self):
+        original = self.c._request.side_effect
+        first = [True]
+        def request(url, data=None, authenticated=False):
+            if '/cdx/' in url and first[0]:
+                first[0] = False
+                self.calls.append((url, data, self.now))
+                return 429, {}, 'overloaded', url
+            return original(url, data, authenticated)
+        self.c._request.side_effect = request
+        self.r.process(URL)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertGreaterEqual(self.posts()[0][1] - self.calls[0][2], 1200)
+
+    def test_three_public_cdx_pauses_stop_before_fourth_request(self):
+        def request(url, data=None, authenticated=False):
+            self.calls.append((url, data, self.now))
+            return 429, {}, 'overloaded', url
+        self.c._request.side_effect = request
+        self.r.run_queue([URL, BASE + '/cart'], 'all')
+        self.assertEqual(len(self.calls), 3)
+        self.assertTrue(all('/cdx/' in u for u, _, _ in self.calls))
+        self.assertEqual(self.posts(), [])
+        self.assertTrue(self.r.pause_circuit_open)
+        self.assertEqual(self.now, self.calls[-1][2])
+
+    def test_429_headers_survive_body_read_failure_and_count_once(self):
+        from capture import LookupFailure
+        response = Mock(status=429, headers={}, url='https://web.archive.org/cdx/search/cdx')
+        response.__enter__ = Mock(return_value=response); response.__exit__ = Mock(return_value=False)
+        response.read.side_effect = OSError('broken read')
+        self.c._request = Client._request.__get__(self.c, Client)
+        with patch('capture.ur.build_opener') as opener:
+            opener.return_value.open.return_value = response
+            with self.assertRaises(LookupFailure):
+                self.c.paced_request(response.url)
+        self.assertEqual(self.r.paused_responses, 1)
+        self.assertGreaterEqual(self.r.state['_archive_next_request_at'], self.now + 1200)
+
+    def test_global_floor_at_least_120_seconds_between_posts(self):
+        self.r.run_queue([URL, BASE + '/cart'], 'all')
+        self.assertEqual(len(self.posts()), 2)
+        self.assertGreaterEqual(self.posts()[1][1] - self.posts()[0][1], 120)
+
+    def test_old_daily_queue_preserved_but_removed_urls_never_executed(self):
+        old_key = 'all:20261104:capture'
+        old = {'urls': [BASE + '/cart/51183558787357:1?storefront=true', BASE + '/collections/all?page=2', self.product, URL],
+            'cursor': 0, 'results': [{'url': URL, 'state': 'verified', 'timestamp': '20261104110000'}], 'complete': False}
+        self.r.state['_queues'] = {old_key: old}
+        self.r.save()
+        self.r.run_queue([URL, self.product], 'all')
+        self.assertEqual(self.r.state['_queues'][old_key], old)
+        self.assertEqual([u for u, _ in self.posts()], [URL, self.product])
+        self.assertFalse(any(r['state'] == 'verified' for r in self.r.results))
+
+    def test_completed_new_queue_pass_keeps_earlier_history(self):
+        self.r.run_queue([self.product], 'all')
+        original = json.loads(json.dumps(self.r.state['_queues']['all:20261104:capture:daily-v2']))
+        self.restart().run_queue([self.product], 'all')
+        histories = [v for k, v in self.r.state['_queues'].items() if ':pass:' in k]
+        self.assertIn(original, histories)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_main_prioritizes_all_twelve_and_reports_missing_names(self):
+        from capture import main, PRIORITY
+        with patch('sys.argv', ['capture.py', '--state', 'state.json']), patch('capture.Client', return_value=self.c), \
+                patch('capture.discover', return_value=[self.product]):
+            self.assertEqual(main(), 1)
+        self.assertEqual([u for u, _ in self.posts()], [BASE + p for p in PRIORITY] + [self.product])
+
+    def test_discovery_failure_still_runs_tier_one_and_count_unknown(self):
+        from capture import main, PRIORITY
+        os.environ['GITHUB_STEP_SUMMARY'] = 'summary.txt'
+        with patch('sys.argv', ['capture.py', '--state', 'state.json']), patch('capture.Client', return_value=self.c), \
+                patch('capture.discover', side_effect=LookupFailure('catalog unavailable')):
+            self.assertEqual(main(), 1)
+        self.assertEqual([u for u, _ in self.posts()], [BASE + p for p in PRIORITY])
+        summary = Path('summary.txt').read_text()
+        self.assertIn('Products with no verified capture: unknown', summary)
+        self.assertIn('/policies/refund-policy', summary)
+
+    def test_malformed_pause_checkpoint_fails_closed(self):
+        from capture import StateContinuityError
+        for value in ({'run': '12345:1', 'count': True}, {'run': '12345:1', 'count': 4}, {'day': '20261104', 'count': 1}):
+            state = {'_next_submit': 0, '_pause_responses': value}
+            Path('bad.json').write_text(json.dumps(state))
+            with self.assertRaises(StateContinuityError):
+                Runner(self.c, 'bad.json')
+        self.assertEqual(self.calls, [])
+
+    def test_replay_429_waits_twenty_minutes_and_never_submits(self):
+        from urllib.parse import parse_qs, urlsplit
+        ts = timestamp(self.now - 60)
+        replay_count = [0]
+        def request(url, data=None, authenticated=False):
+            self.calls.append((url, data, self.now))
+            if '/cdx/' in url:
+                target = parse_qs(urlsplit(url).query)['url'][0]
+                return 200, {}, json.dumps([FIELDS, [ts, target, '200', 'text/html', 'digest']]), url
+            replay_count[0] += 1
+            if replay_count[0] == 1:
+                return 429, {}, 'overloaded', url
+            return 200, {'Content-Type': 'text/html'}, GOOD, url
+        self.c._request.side_effect = request
+        row = self.r.process(URL)
+        self.assertEqual(row['state'], 'verified')
+        self.assertEqual(row['capture_timestamp'], ts)
+        self.assertEqual(self.posts(), [])
+        self.assertGreaterEqual(self.calls[-1][2] - self.calls[-2][2], 1200)
+        self.assertEqual(self.r.paused_responses, 1)
+
+    def test_cdx_pause_budget_preserves_unexecuted_cursor_and_gate(self):
+        self.r.deadline = self.c.archive_deadline = self.now + 1000
+        def request(url, data=None, authenticated=False):
+            self.calls.append((url, data, self.now))
+            return 429, {'Retry-After': '3600'}, 'overloaded', url
+        self.c._request.side_effect = request
+        self.r.run_queue([URL, self.product], 'all')
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.posts(), [])
+        queue = self.r.state['_queues']['all:20261104:capture:daily-v2']
+        self.assertEqual(queue['cursor'], 0)
+        self.assertEqual(queue['retry_same_url'], URL)
+        self.assertGreaterEqual(self.r.state['_archive_next_request_at'], self.now + 3600)
+
+    def test_overloaded_200_cdx_counts_toward_three_response_breaker(self):
+        def request(url, data=None, authenticated=False):
+            self.calls.append((url, data, self.now))
+            return 200, {}, json.dumps({'status': 'error', 'message': 'overloaded'}), url
+        self.c._request.side_effect = request
+        self.r.run_queue([URL], 'all')
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(self.posts(), [])
+        self.assertTrue(self.r.pause_circuit_open)
+
+    def test_health_and_account_responses_do_not_reset_pause_streak(self):
+        self.r.observe_archive_response('https://web.archive.org/cdx/search/cdx', 429, {}, {})
+        for path in ('/save/status/system', '/save/status/user'):
+            self.r.observe_archive_response('https://web.archive.org' + path, 200, {}, {'status': 'success'})
+        self.assertEqual(self.r.paused_responses, 1)
+        self.r.observe_archive_response('https://web.archive.org/save/', 200, {}, {})
+        self.assertEqual(self.r.paused_responses, 1)
+
+    def test_interrupted_pause_marker_reconciles_same_accepted_job(self):
+        key = 'priority:20261104:capture:daily-v2'
+        self.r.state['_queues'] = {key: {'urls': [URL], 'cursor': 0, 'results': [],
+            'complete': False, 'started': URL, 'retry_same_url': URL}}
+        self.r.state[URL] = {'submitted_at': self.now - 60, 'job_id': 'accepted-job'}
+        self.r.state['_pause_responses'] = {'run': '12345:1', 'count': 1}
+        self.r.state['_archive_next_request_at'] = self.now + 1200
+        self.r.save()
+        self.restart().run_queue([URL], 'priority')
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(len([u for u, _, _ in self.calls if '/save/status/accepted-job' in u]), 1)
+        self.assertEqual(self.r.state[URL]['job_id'], 'accepted-job')
+        self.assertEqual(self.r.state['_queues'][key]['cursor'], 1)
+        self.assertNotIn('retry_same_url', self.r.state['_queues'][key])
+
+    def test_mapped_outlink_product_attempt_counts_even_if_previously_verified(self):
+        root = BASE + '/collections/all'
+        batch = {'root_url': root, 'post_state': 'response_received', 'expansion_state': 'mapping_reported',
+            'utc_day': self.r.since, 'attempt': {'started_at': self.now - 60},
+            'children': {'child': {'url': self.product, 'job_ids': ['child-job'], 'coverage': 'verified'}},
+            'child_order': ['child'], 'verification_cursor': 1}
+        self.r.state['_outlink_batches'] = {root: batch}
+        self.r.save()
+        self.assertEqual(self.restart().process(self.product)['state'], 'deferred')
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(self.r.state['_outlink_batches'][root], batch)
+
+    def test_resumed_product_cursor_reconciles_missing_tier_one_first(self):
+        from capture import main, PRIORITY
+        from urllib.parse import parse_qs, urlsplit
+        product_two = BASE + '/products/second-watch'
+        ts = timestamp(self.now - 60)
+        rows = [{'url': BASE + path, 'state': 'verified', 'timestamp': ts,
+                 'capture_timestamp': ts} for path in PRIORITY[1:]]
+        rows.insert(0, {'url': URL, 'state': 'pending', 'capture_timestamp': None})
+        self.r.state['_queues'] = {
+            'priority:20261104:capture:daily-v2': {'urls': [BASE + p for p in PRIORITY],
+                'cursor': len(PRIORITY), 'complete': True, 'results': rows},
+            'all:20261104:capture:daily-v2': {'urls': [self.product, product_two], 'cursor': 1,
+                'complete': False, 'results': [{'url': self.product, 'state': 'failed', 'capture_timestamp': None}]}}
+        self.r.state[URL] = {'submitted_at': self.now - 120, 'job_id': 'accepted-job'}
+        self.r.save()
+        original = self.c._request.side_effect
+        def request(url, data=None, authenticated=False):
+            if '/cdx/' in url and parse_qs(urlsplit(url).query)['url'][0] == URL:
+                self.calls.append((url, data, self.now))
+                return 200, {}, json.dumps([FIELDS, [ts, URL, '200', 'text/html', 'digest']]), url
+            if '/web/' in url:
+                self.calls.append((url, data, self.now))
+                return 200, {'Content-Type': 'text/html'}, GOOD, url
+            return original(url, data, authenticated)
+        self.c._request.side_effect = request
+        os.environ['GITHUB_STEP_SUMMARY'] = 'summary.txt'
+        with patch('sys.argv', ['capture.py', '--state', 'state.json']), patch('capture.Client', return_value=self.c), \
+                patch('capture.discover', return_value=[self.product, product_two]):
+            self.assertEqual(main(), 0)  # Missing products are counted, tier 1 determines failure.
+        self.assertEqual([u for u, _ in self.posts()], [product_two])
+        self.assertEqual(parse_qs(urlsplit(self.calls[0][0]).query)['url'][0], URL)
+        self.assertIn('Tier 1 pages with no verified capture: none', Path('summary.txt').read_text())
+        self.assertIn('Products with no verified capture: 2', Path('summary.txt').read_text())
+        state = json.loads(Path('state.json').read_text())
+        self.assertNotIn(URL, state)
+        self.assertEqual(state['_queues']['all:20261104:capture:daily-v2']['cursor'], 2)
+        self.assertTrue(any(':pass:' in key for key in state['_queues']))
+
+    def test_priority_only_summary_does_not_claim_zero_missing_products(self):
+        from capture import main
+        os.environ['GITHUB_STEP_SUMMARY'] = 'summary.txt'
+        with patch('sys.argv', ['capture.py', '--scope', 'priority', '--state', 'state.json']), patch('capture.Client', return_value=self.c):
+            self.assertEqual(main(), 1)
+        self.assertIn('Products with no verified capture: not assessed (priority-only scope)', Path('summary.txt').read_text())
+
+    def test_verified_retired_product_attempt_still_prevents_second_post(self):
+        self.r.state[self.product] = {'submitted_at': self.now - 60, 'job_id': 'accepted-job'}
+        self.r.save()
+        original = self.c.verify
+        self.c.verify = Mock(return_value={'timestamp': timestamp(self.now), 'original': self.product})
+        self.assertEqual(self.r.process(self.product)['state'], 'verified')
+        self.c.verify = original
+        self.assertEqual(self.restart().process(self.product)['state'], 'deferred')
+        self.assertEqual(self.posts(), [])
+
+
+    def test_partial_priority_prefix_revisited_after_saved_pause_target(self):
+        from capture import main, PRIORITY
+        from urllib.parse import parse_qs, urlsplit
+        shipping = BASE + PRIORITY[2]
+        ts = timestamp(self.now - 60)
+        self.r.state['_queues'] = {'priority:20261104:capture:daily-v2': {
+            'urls': [BASE + p for p in PRIORITY], 'cursor': 2, 'complete': False,
+            'retry_same_url': shipping, 'results': [
+                {'url': URL, 'state': 'pending', 'capture_timestamp': None},
+                {'url': BASE + PRIORITY[1], 'state': 'verified', 'timestamp': ts, 'capture_timestamp': ts}]}}
+        self.r.state[URL] = {'submitted_at': self.now - 120, 'job_id': 'accepted-home'}
+        self.r.state[shipping] = {'submitted_at': self.now - 120, 'job_id': None}
+        self.r.save()
+        original = self.c._request.side_effect
+        def request(url, data=None, authenticated=False):
+            if '/cdx/' in url and parse_qs(urlsplit(url).query)['url'][0] == URL:
+                self.calls.append((url, data, self.now))
+                return 200, {}, json.dumps([FIELDS, [ts, URL, '200', 'text/html', 'digest']]), url
+            if '/web/' in url:
+                self.calls.append((url, data, self.now))
+                return 200, {'Content-Type': 'text/html'}, GOOD, url
+            return original(url, data, authenticated)
+        self.c._request.side_effect = request
+        with patch('sys.argv', ['capture.py', '--state', 'state.json']), patch('capture.Client', return_value=self.c), \
+                patch('capture.discover', return_value=[self.product]):
+            self.assertEqual(main(), 1)
+        checked = [parse_qs(urlsplit(u).query)['url'][0] for u, _, _ in self.calls if '/cdx/' in u]
+        self.assertEqual(checked[:2], [shipping, URL])
+        self.assertNotIn(shipping, [u for u, _ in self.posts()])
+        self.assertEqual(self.posts()[-1][0], self.product)
+        state = json.loads(Path('state.json').read_text())
+        self.assertNotIn(URL, state)
+        self.assertIsNone(state[shipping]['job_id'])
+        self.assertTrue(any(':pass:' in key for key in state['_queues']))
+
+    def test_malformed_attempt_history_never_grants_product_dispatch(self):
+        for request in (None, {'attempts': [None]}, {'attempts': [{'started_at': 'unknown'}]}, {'attempts': 42}):
+            with self.subTest(request=request):
+                self.r.state['_completed_jobs'] = [{'url': self.product, 'state': 'failed',
+                    'submitted_at': self.now - 86400, 'request_evidence': request}]
+                self.r.save()
+                row = self.restart().process(self.product)
+                self.assertEqual(row['state'], 'unverified')
+                self.assertIn('Malformed product', row['reason'])
+                self.assertEqual(self.posts(), [])
+
+    def test_malformed_mapped_outlink_attempt_is_unverified_not_crash(self):
+        root = BASE + '/collections/all'
+        for attempt in (None, [], 'unknown', {'started_at': 'unknown'}):
+            with self.subTest(attempt=attempt):
+                batch = {'root_url': root, 'post_state': 'response_received', 'expansion_state': 'mapping_reported',
+                    'utc_day': 0, 'attempt': attempt,
+                    'children': {'child': {'url': self.product, 'job_ids': ['job'], 'coverage': 'verified'}},
+                    'child_order': ['child'], 'verification_cursor': 1}
+                self.r.state['_outlink_batches'] = {root: batch}
+                self.r.save()
+                row = self.restart().process(self.product)
+                self.assertEqual(row['state'], 'unverified')
+                self.assertIn('Malformed outlink', row['reason'])
+                self.assertEqual(self.posts(), [])
+
+
+    def test_only_valid_job_id_can_reset_pause_streak_without_status(self):
+        endpoint = 'https://web.archive.org/save/'
+        self.r.observe_archive_response(endpoint, 429, {}, {})
+        self.r.observe_archive_response(endpoint, 429, {}, {})
+        for job_id in ({'job': 'invalid'}, ['invalid'], 123, True, 'bad job', 'bad/job', '', None):
+            with self.subTest(job_id=job_id):
+                self.r.observe_archive_response(endpoint, 200, {}, {'job_id': job_id})
+                self.assertEqual(self.r.paused_responses, 2)
+        self.r.observe_archive_response(endpoint, 200, {}, {'job_id': 'valid-job_123'})
+        self.assertEqual(self.r.paused_responses, 0)
+
+    def outlink_day_journal(self, started, children=None, **changes):
+        root = BASE + '/collections/all'
+        children = {} if children is None else children
+        batch = {'root_url': root, 'post_state': 'outcome_unknown', 'expansion_state': 'unknown',
+            'utc_day': self.r.since, 'created_at': self.now, 'attempt': {'started_at': started},
+            'children': children, 'child_order': list(children), 'verification_cursor': 0}
+        batch.update(changes)
+        self.r.state['_outlink_batches'] = {root: batch}
+        return batch
+
+    def test_yesterday_jobless_outlink_allows_homepage_and_product_without_erasing_history(self):
+        self.outlink_day_journal(self.r.since - 1)
+        history = json.dumps(self.r.state['_outlink_batches'], sort_keys=True)
+        self.r.save()
+        for url in (URL, self.product):
+            self.assertEqual(self.restart().process(url)['state'], 'failed')
+        self.assertEqual([url for url, _ in self.posts()], [URL, self.product])
+        self.assertEqual(json.dumps(json.loads(Path('state.json').read_text())['_outlink_batches'], sort_keys=True), history)
+
+    def test_today_jobless_outlink_still_holds_homepage_and_product(self):
+        self.outlink_day_journal(self.r.since)
+        self.r.save()
+        original = json.dumps(self.r.state['_outlink_batches'], sort_keys=True)
+        for url in (URL, self.product):
+            self.assertEqual(self.restart().process(url)['state'], 'outlink-held')
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(json.dumps(json.loads(Path('state.json').read_text())['_outlink_batches'], sort_keys=True), original)
+
+    def test_outlink_hold_uses_actual_utc_midnight_even_when_runner_day_is_stale(self):
+        from capture import outlink_attempt_before_today
+        midnight = self.r.since + 86400
+        batch = self.outlink_day_journal(midnight - 0.001, children={
+            'child': {'url': self.product, 'job_ids': ['child-job'], 'coverage': 'unverified'}})
+        self.now = midnight - 0.001
+        self.assertFalse(outlink_attempt_before_today(batch))
+        self.assertIsNotNone(self.r.outlink_submission_hold(URL))
+        self.assertTrue(self.r.product_attempted_today(self.product))
+        self.now = midnight
+        self.assertLess(self.r.since, midnight)  # No Runner restart or stale-day shortcut.
+        self.assertTrue(outlink_attempt_before_today(batch))
+        self.assertIsNone(self.r.outlink_submission_hold(URL))
+        self.assertFalse(self.r.product_attempted_today(self.product))
+        batch['attempt']['started_at'] = midnight
+        self.assertFalse(outlink_attempt_before_today(batch))
+        self.assertIsNotNone(self.r.outlink_submission_hold(URL))
+        self.assertTrue(self.r.product_attempted_today(self.product))
+
+    def test_outlink_age_uses_attempt_not_created_at_or_utc_day(self):
+        for started, other_day, expired in ((self.r.since - 1, self.now, True),
+                                           (self.r.since, self.r.since - 86400, False)):
+            with self.subTest(started=started):
+                self.outlink_day_journal(started, utc_day=other_day, created_at=other_day)
+                for url in (URL, self.product):
+                    self.assertEqual(self.r.outlink_submission_hold(url) is None, expired)
+        self.assertEqual(self.posts(), [])
+
+    def test_missing_or_invalid_outlink_start_falls_back_to_utc_day(self):
+        from capture import outlink_attempt_before_today, outlink_attempt_time
+        attempts = [None, [], 'unknown', {}] + [{'started_at': value} for value in
+            (None, True, False, 0, -1, float('nan'), float('inf'), float('-inf'),
+             '20261103', {}, [], 1e15, 10**1000, -(10**1000))]
+        for attempt in attempts:
+            with self.subTest(attempt=attempt):
+                batch = self.outlink_day_journal(None, utc_day=self.r.since - 86400,
+                    created_at=self.now, attempt=attempt)
+                self.assertEqual(outlink_attempt_time(batch), self.r.since - 86400)
+                self.assertTrue(outlink_attempt_before_today(batch))
+                for url in (URL, self.product):
+                    self.assertIsNone(self.r.outlink_submission_hold(url))
+        batch.pop('attempt')
+        self.assertTrue(outlink_attempt_before_today(batch))
+        self.assertEqual(self.posts(), [])
+
+    def test_missing_or_invalid_mapped_start_uses_same_utc_day_fallback(self):
+        children = {'child': {'url': self.product, 'job_ids': ['child-job'], 'coverage': 'verified'}}
+        for attempt in (None, {}, {'started_at': None}, {'started_at': True}, {'started_at': 0},
+                        {'started_at': -1}, {'started_at': float('nan')}, {'started_at': float('inf')},
+                        {'started_at': 10**1000}, {'started_at': -(10**1000)}):
+            for day, attempted in ((self.r.since - 86400, False), (self.r.since, True)):
+                with self.subTest(attempt=attempt, day=day):
+                    self.outlink_day_journal(None, children=children,
+                        expansion_state='mapping_reported', utc_day=day, attempt=attempt)
+                    self.assertEqual(self.r.product_attempted_today(self.product), attempted)
+        self.assertEqual(self.posts(), [])
+
+    def test_no_attempt_start_with_yesterday_utc_day_allows_homepage_and_product(self):
+        for attempt in (None, {}):
+            with self.subTest(attempt=attempt):
+                batch = self.outlink_day_journal(None, utc_day=self.r.since - 86400)
+                if attempt is None:
+                    batch.pop('attempt')
+                else:
+                    batch['attempt'] = attempt
+                history = json.dumps(self.r.state['_outlink_batches'], sort_keys=True)
+                seed_test_state('state.json', {'_outlink_batches': self.r.state['_outlink_batches']})
+                self.calls.clear()
+                for url in (URL, self.product):
+                    self.assertEqual(self.restart().process(url)['state'], 'failed')
+                self.assertEqual([url for url, _ in self.posts()], [URL, self.product])
+                saved = json.loads(Path('state.json').read_text())
+                self.assertEqual(json.dumps(saved['_outlink_batches'], sort_keys=True), history)
+
+    def test_invalid_start_with_yesterday_utc_day_allows_homepage_and_product(self):
+        self.outlink_day_journal('invalid', utc_day=self.r.since - 86400)
+        history = json.dumps(self.r.state['_outlink_batches'], sort_keys=True)
+        self.r.save()
+        for url in (URL, self.product):
+            self.assertEqual(self.restart().process(url)['state'], 'failed')
+        self.assertEqual([url for url, _ in self.posts()], [URL, self.product])
+        self.assertEqual(json.dumps(self.r.state['_outlink_batches'], sort_keys=True), history)
+
+    def test_created_at_fallback_with_missing_or_invalid_utc_day_survives_reload(self):
+        for day in (None, 'invalid', 0, False, -1, 10**1000):
+            with self.subTest(day=day):
+                batch = self.outlink_day_journal(None, utc_day=day, created_at=self.r.since - 1)
+                batch.pop('attempt')
+                if day is None:
+                    batch.pop('utc_day')
+                history = json.dumps(self.r.state['_outlink_batches'], sort_keys=True)
+                seed_test_state('state.json', {'_outlink_batches': self.r.state['_outlink_batches']})
+                self.calls.clear()
+                for url in (URL, self.product):
+                    self.assertEqual(self.restart().process(url)['state'], 'failed')
+                self.assertEqual([url for url, _ in self.posts()], [URL, self.product])
+                saved = json.loads(Path('state.json').read_text())
+                self.assertEqual(json.dumps(saved['_outlink_batches'], sort_keys=True), history)
+
+    def test_created_at_fallback_is_shared_by_mapped_product_accounting(self):
+        import hashlib
+        for child in ({'url': self.product}, {'url_sha256': hashlib.sha256(self.product.encode()).hexdigest()}):
+            child = {**child, 'job_ids': ['mapped-job'], 'coverage': 'verified'}
+            for day, expected in ((self.r.since - 1, 'failed'), (self.r.since, 'deferred')):
+                with self.subTest(child=child, day=day):
+                    batch = self.outlink_day_journal(None, children={'mapped': child},
+                        expansion_state='mapping_reported', utc_day='invalid', created_at=day)
+                    history = json.dumps(self.r.state['_outlink_batches'], sort_keys=True)
+                    seed_test_state('state.json', {'_outlink_batches': self.r.state['_outlink_batches']})
+                    self.calls.clear()
+                    self.assertEqual(self.restart().process(self.product)['state'], expected)
+                    self.assertEqual([url for url, _ in self.posts()], [self.product] if expected == 'failed' else [])
+                    self.assertEqual(json.dumps(self.r.state['_outlink_batches'], sort_keys=True), history)
+
+    def test_today_or_future_primary_never_falls_back_to_older_fields(self):
+        from capture import outlink_attempt_time, outlink_attempt_before_today
+        for started in (self.r.since, self.now, self.now + 86400, 1e15 - 1):
+            with self.subTest(started=started):
+                batch = self.outlink_day_journal(started, utc_day=self.r.since - 86400,
+                    created_at=self.r.since - 86400)
+                self.assertEqual(outlink_attempt_time(batch), started)
+                self.assertFalse(outlink_attempt_before_today(batch))
+                for url in (URL, self.product):
+                    self.assertIsNotNone(self.r.outlink_submission_hold(url))
+        self.assertEqual(self.posts(), [])
+
+    def test_current_or_future_utc_day_precedes_older_created_at(self):
+        from capture import outlink_attempt_time, outlink_attempt_before_today
+        for day in (self.r.since, self.r.since + 86400):
+            with self.subTest(day=day):
+                batch = self.outlink_day_journal('invalid', utc_day=day, created_at=self.r.since - 1)
+                self.assertEqual(outlink_attempt_time(batch), day)
+                self.assertFalse(outlink_attempt_before_today(batch))
+                for url in (URL, self.product):
+                    self.assertIsNotNone(self.r.outlink_submission_hold(url))
+        self.assertEqual(self.posts(), [])
+
+    def test_future_selected_timestamp_does_not_release_verified_mapped_product(self):
+        import hashlib
+        for child in ({'url': self.product}, {'url_sha256': hashlib.sha256(self.product.encode()).hexdigest()}):
+            for source in ('attempt', 'utc_day', 'created_at'):
+                with self.subTest(child=child, source=source):
+                    batch = self.outlink_day_journal(None, children={'mapped': {
+                        **child, 'job_ids': ['mapped-job'], 'coverage': 'verified'}},
+                        expansion_state='mapping_reported', utc_day=0, created_at=self.r.since - 1)
+                    if source == 'attempt':
+                        batch['attempt']['started_at'] = self.r.since + 86400
+                    else:
+                        batch[source] = self.r.since + 86400
+                    history = json.dumps(self.r.state['_outlink_batches'], sort_keys=True)
+                    seed_test_state('state.json', {'_outlink_batches': self.r.state['_outlink_batches']})
+                    self.calls.clear()
+                    row = self.restart().process(self.product)
+                    self.assertEqual(row['state'], 'unverified')
+                    self.assertIn('Future outlink', row['reason'])
+                    self.assertEqual(self.posts(), [])
+                    self.assertEqual(json.dumps(self.r.state['_outlink_batches'], sort_keys=True), history)
+
+    def test_no_valid_timestamp_preserves_jobless_hold_and_mapped_protection(self):
+        from capture import outlink_attempt_time, outlink_attempt_before_today
+        for invalid in (None, 'invalid', True, False, 0, -1, float('nan'), float('inf'),
+                        float('-inf'), 1e15, 10**1000, -(10**1000), {}, []):
+            with self.subTest(invalid=invalid):
+                batch = self.outlink_day_journal(invalid, utc_day=invalid, created_at=invalid)
+                self.assertIsNone(outlink_attempt_time(batch))
+                self.assertFalse(outlink_attempt_before_today(batch))
+                for url in (URL, self.product):
+                    self.assertIsNotNone(self.r.outlink_submission_hold(url))
+                batch['children'] = {'mapped': {'url': self.product, 'job_ids': ['job'], 'coverage': 'verified'}}
+                with self.assertRaisesRegex(LookupFailure, 'Malformed outlink'):
+                    self.r.product_attempted_today(self.product)
+        self.assertEqual(self.posts(), [])
+
+    def test_zero_day_without_valid_fallback_remains_held_after_reload(self):
+        self.outlink_day_journal(None, utc_day=0, created_at=None)
+        history = json.dumps(self.r.state['_outlink_batches'], sort_keys=True)
+        self.r.save()
+        for url in (URL, self.product):
+            self.assertEqual(self.restart().process(url)['state'], 'outlink-held')
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(json.dumps(self.r.state['_outlink_batches'], sort_keys=True), history)
+
+    def test_missing_or_invalid_all_dates_still_fail_closed_at_state_load(self):
+        from capture import StateContinuityError
+        for day in (None, 'invalid', False, -1, 10**1000):
+            with self.subTest(day=day):
+                batch = self.outlink_day_journal(None, utc_day=day, created_at=None)
+                if day is None:
+                    batch.pop('utc_day')
+                seed_test_state('state.json', self.r.state)
+                original = Path('state.json').read_bytes()
+                with self.assertRaises(StateContinuityError):
+                    self.restart()
+                self.assertEqual(Path('state.json').read_bytes(), original)
+        self.assertEqual(self.calls, [])
+
+    def test_old_mapped_and_redacted_child_holds_expire_but_today_still_holds(self):
+        import hashlib
+        children = {
+            'mapped': {'url': self.product, 'job_ids': ['mapped-job'], 'coverage': 'unverified'},
+            'redacted': {'hostname': 'somervillewatchco.com', 'job_ids': ['redacted-job'], 'coverage': 'unverified'},
+            'hashed': {'url_sha256': hashlib.sha256(self.product.encode()).hexdigest(),
+                       'job_ids': ['hashed-job'], 'coverage': 'unverified'}}
+        self.outlink_day_journal(self.r.since - 1, children=children, expansion_state='mapping_reported')
+        self.r.save()
+        history = json.dumps(self.r.state['_outlink_batches'], sort_keys=True)
+        for url in (URL, self.product):
+            self.assertEqual(self.restart().process(url)['state'], 'failed')
+        self.assertEqual([url for url, _ in self.posts()], [URL, self.product])
+        self.assertEqual(json.dumps(self.r.state['_outlink_batches'], sort_keys=True), history)
+        batch = next(iter(self.r.state['_outlink_batches'].values()))
+        batch['attempt']['started_at'] = self.r.since
+        self.assertIsNotNone(self.r.outlink_submission_hold(URL))
+        self.assertIsNotNone(self.r.outlink_submission_hold(self.product))
+        self.assertTrue(self.r.product_attempted_today(self.product))
+
+    def test_hashed_outlink_mapping_ages_out_without_losing_same_day_product_cap(self):
+        import hashlib
+        child = {'url_sha256': hashlib.sha256(self.product.encode()).hexdigest(),
+                 'job_ids': ['hashed-job'], 'coverage': 'unverified'}
+        batch = self.outlink_day_journal(self.r.since - 1, children={'hash': child},
+            expansion_state='mapping_reported')
+        self.assertIsNone(self.r.outlink_submission_hold(self.product))
+        self.assertFalse(self.r.product_attempted_today(self.product))
+        batch['attempt']['started_at'] = self.r.since
+        self.assertIsNotNone(self.r.outlink_submission_hold(self.product))
+        self.assertTrue(self.r.product_attempted_today(self.product))
+        child['coverage'] = 'verified'
+        self.assertIsNone(self.r.outlink_submission_hold(self.product))
+        self.assertTrue(self.r.product_attempted_today(self.product))
+        self.assertEqual(self.posts(), [])
+
+    def test_historical_outlink_does_not_hide_another_current_day_hold(self):
+        self.outlink_day_journal(self.r.since - 1)
+        root = BASE + '/collections/all?page=2'
+        self.r.state['_outlink_batches'][root] = {
+            **next(iter(self.r.state['_outlink_batches'].values())), 'root_url': root,
+            'attempt': {'started_at': self.r.since}}
+        for url in (URL, self.product):
+            self.assertEqual(self.r.process(url)['state'], 'outlink-held')
+        self.assertEqual(self.posts(), [])
+
+    def test_historical_outlink_does_not_release_unknown_direct_pending_jobs(self):
+        self.outlink_day_journal(self.r.since - 1)
+        direct = {'job_id': None, 'submitted_at': self.r.since - 60}
+        for url in (URL, self.product):
+            self.r.state[url] = dict(direct)
+        self.r.save()
+        for url in (URL, self.product):
+            self.assertEqual(self.restart().process(url)['state'], 'pending')
+            self.assertEqual(self.r.state[url], direct)
+        self.assertEqual(self.posts(), [])
+
+    def test_historical_outlink_does_not_replace_accepted_direct_pending_jobs(self):
+        self.outlink_day_journal(self.r.since - 1)
+        for url in (URL, self.product):
+            self.r.state[url] = {'job_id': 'accepted-job', 'submitted_at': self.r.since - 60}
+        self.r.save()
+        for url in (URL, self.product):
+            self.assertEqual(self.restart().process(url)['state'], 'pending')
+            self.assertEqual(self.r.state[url]['job_id'], 'accepted-job')
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(len([url for url, _, _ in self.calls if '/save/status/accepted-job' in url]), 2)
+
+    def test_historical_outlink_does_not_clear_independent_cooldowns(self):
+        for key in ('_next_submit', '_archive_next_request_at', '_transport_cooldown_until'):
+            with self.subTest(key=key):
+                self.outlink_day_journal(self.r.since - 1)
+                until = self.now + 30000
+                seed_test_state('state.json', {'_outlink_batches': self.r.state['_outlink_batches'], key: until})
+                self.restart()
+                self.assertIsNone(self.r.outlink_submission_hold(URL))
+                self.assertEqual(self.r.process(URL)['state'], 'deferred')
+                self.assertEqual(self.r.state[key], until)
+                self.assertEqual(self.posts(), [])
+
+    def test_historical_outlink_does_not_bypass_state_schema_validation(self):
+        from capture import StateContinuityError
+        for changes in ({'children': []}, {'post_state': 'invalid'}, {'expansion_state': 'invalid'},
+                        {'server_paused_until': 'unknown'}, {'verification_cursor': -1}):
+            with self.subTest(changes=changes):
+                self.outlink_day_journal(self.r.since - 1, **changes)
+                seed_test_state('state.json', self.r.state)
+                original = Path('state.json').read_bytes()
+                with self.assertRaises(StateContinuityError):
+                    self.restart()
+                self.assertEqual(Path('state.json').read_bytes(), original)
+        self.assertEqual(self.calls, [])
+
+    def test_priority_and_all_never_dispatch_or_create_outlink_batches(self):
+        from capture import main, PRIORITY
+        for scope in ('priority', 'all'):
+            for has_history in (False, True):
+                with self.subTest(scope=scope, has_history=has_history):
+                    self.outlink_day_journal(self.r.since - 1)
+                    journals = self.r.state['_outlink_batches'] if has_history else {}
+                    history = json.dumps(journals, sort_keys=True)
+                    seed_test_state('state.json', {'_next_submit': 0, '_outlink_batches': journals})
+                    self.calls.clear()
+                    with patch('sys.argv', ['capture.py', '--scope', scope, '--state', 'state.json']), \
+                            patch('capture.Client', return_value=self.c), \
+                            patch('capture.discover', return_value=[self.product]), \
+                            patch.object(Runner, 'run_outlink_probe', side_effect=AssertionError('daily outlink probe')) as probe:
+                        self.assertEqual(main(), 1)
+                    probe.assert_not_called()
+                    expected = [BASE + path for path in PRIORITY] + ([self.product] if scope == 'all' else [])
+                    self.assertEqual([url for url, _ in self.posts()], expected)
+                    for _, data, _ in self.calls:
+                        if data is not None:
+                            self.assertEqual(set(data), {'url', 'if_not_archived_within'})
+                    saved = json.loads(Path('state.json').read_text())
+                    self.assertEqual(json.dumps(saved['_outlink_batches'], sort_keys=True), history)
+
 
 # Keep additional regressions discoverable through the unchanged production CI command.
 from test_verification_candidate import CDXSchemaCandidateTests, CanonicalParserCandidateTests
