@@ -1,4 +1,4 @@
-"""Gate the existing noon EST workflow: capture only after today's primary fails."""
+"""Gate the existing 4 p.m. EST workflow: capture only after today's primary fails."""
 import datetime as dt
 import json
 import os
@@ -8,7 +8,7 @@ import urllib.request
 
 PRIMARY_TITLE = 'Cart and policies - primary'
 PRIMARY_CRON = '0 9 * * *'
-RETRY_CRON = '0 17 * * *'
+RETRY_CRON = '0 21 * * *'
 
 
 def retry_decision(runs, today):

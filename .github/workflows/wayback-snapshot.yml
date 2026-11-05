@@ -1,10 +1,10 @@
 name: Daily Wayback Machine Policy Snapshot
-run-name: Cart and policies - ${{ github.event_name == 'schedule' && (github.event.schedule == '0 17 * * *' && 'retry' || 'primary') || 'manual' }}
+run-name: Cart and policies - ${{ github.event_name == 'schedule' && (github.event.schedule == '0 21 * * *' && 'retry' || github.event.schedule == '0 9 * * *' && 'primary' || 'superseded') || 'manual' }}
 on:
   schedule:
-    # Fixed EST (UTC-5): daily primary at 4 a.m.; retry at noon only after failure.
+    # Fixed EST (UTC-5): daily primary at 4 a.m.; retry at 4 p.m. only after failure.
     - cron: '0 9 * * *'
-    - cron: '0 17 * * *'
+    - cron: '0 21 * * *'
   workflow_dispatch:
     inputs:
       scope:

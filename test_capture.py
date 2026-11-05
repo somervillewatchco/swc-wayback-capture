@@ -3299,7 +3299,7 @@ class DailyBatchPipelineTests(unittest.TestCase):
         self.assertLess(len(primary_posts), 9)
         state = json.loads(Path('state.json').read_text())
         self.assertGreaterEqual(state['_next_submit'], primary_posts[-1][1] + 3600)
-        self.now = self.since + 17 * 3600  # Existing noon EST failure-only retry.
+        self.now = self.since + 21 * 3600  # 4 p.m. EST failure-only retry.
         os.environ['GITHUB_RUN_ID'] = '50003'
         with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--budget', '19800', '--state', 'state.json']), \
                 patch('capture.Client', return_value=self.c), patch('builtins.print'):
@@ -3531,7 +3531,8 @@ class PolicyScheduleTests(unittest.TestCase):
         from capture_schedule import main, PRIMARY_CRON
         with tempfile.TemporaryDirectory() as temp:
             for event, cron, expected in [('schedule', PRIMARY_CRON, True), ('workflow_dispatch', '', True),
-                                           ('schedule', '7 0,6,12,18 * * *', False)]:
+                                           ('schedule', '7 0,6,12,18 * * *', False),
+                                           ('schedule', '0 17 * * *', False)]:
                 output = Path(temp) / 'output'
                 output.write_text('')
                 with patch.dict(os.environ, {'GITHUB_EVENT_NAME': event, 'SCHEDULE': cron,
