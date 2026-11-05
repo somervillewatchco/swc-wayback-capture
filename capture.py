@@ -24,6 +24,8 @@ PRIORITY = ['/', '/policies/refund-policy', '/policies/shipping-policy',
  '/policies/contact-information', '/policies/legal-notice', '/pages/contact',
  '/pages/warranty-policy', '/pages/no-brand-affiliation',
  '/policies/subscription-policy', '/cart']
+# Temporary user-authorized scope: cart plus policy/legal pages, with no product discovery.
+POLICIES = [path for path in PRIORITY if path not in ('/', '/pages/contact', '/pages/no-brand-affiliation')]
 TRANSPORT_PROBE = BASE + '/products/date-mod-ice-blue-arabic-watch'
 PACING_PROBE = BASE + '/products/date-mod-olive-green-watch'
 SUPPLEMENTAL_PROBE = BASE + '/pages/about-us'
@@ -268,7 +270,7 @@ def operational_summary(state):
     for key, queue in queue_map.items():
         if not isinstance(key, str) or not isinstance(queue, dict):
             continue
-        if not re.fullmatch(r'(all|priority|pilot|supplemental|transport_probe|pacing_probe|supplemental_probe):[0-9]{8}:(capture|poll|verify)(?::daily-v[23])?(?::pass:[0-9]+)?', key):
+        if not re.fullmatch(r'(all|priority|policies|pilot|supplemental|transport_probe|pacing_probe|supplemental_probe):[0-9]{8}:(capture|poll|verify)(?::daily-v[23])?(?::pass:[0-9]+)?', key):
             continue
         urls = queue.get('urls', [])
         total = len(urls) if isinstance(urls, list) else 0
@@ -1564,8 +1566,8 @@ class Runner:
         across invocations; accepted/uncertain jobs always follow _process's
         retained-state checks. Every stage uses the same Archive request gate.
         """
-        if scope not in ('all', 'priority'):
-            raise ValueError('Daily batches require all or priority scope')
+        if scope not in ('all', 'priority', 'policies'):
+            raise ValueError('Daily batches require all, priority or policies scope')
         mode = 'verify' if self.verify_only else 'poll' if self.poll_only else 'capture'
         prefix = scope + ':' + timestamp(self.since)[:8] + ':' + mode
         key = prefix + ':daily-v3'
@@ -1575,7 +1577,7 @@ class Runner:
         # positive evidence only; never import an old cursor or absent result.
         previous = queue or queues.get(prefix + ':daily-v2')
         targets = list(dict.fromkeys(urls))
-        rebuild = not queue or queue['complete'] or scope == 'priority'
+        rebuild = not queue or queue['complete'] or scope in ('priority', 'policies')
         if rebuild:
             verified = [r for r in (previous or {}).get('results', [])
                         if r.get('state') == 'verified' and r.get('url') in targets
@@ -2230,12 +2232,12 @@ class Runner:
                 return self.result(url, 'unverified', reason='Archive transport failed', transport=detail)
             return self.result(url, 'unverified', reason=str(exc))
 
-def daily_summary(urls, results, since, inventory_complete=True):
+def daily_summary(urls, results, since, inventory_complete=True, priority_paths=None):
     day = timestamp(since)[:8]
     verified = {row['url'] for row in results if row.get('state') == 'verified'
                 and isinstance(row.get('timestamp'), str)
                 and re.fullmatch(day + r'[0-9]{6}', row['timestamp'])}
-    missing = [path for path in PRIORITY if BASE + path not in verified]
+    missing = [path for path in (PRIORITY if priority_paths is None else priority_paths) if BASE + path not in verified]
     products = {url for url in urls if is_product(url)}
     product_count = ('not assessed (priority-only scope)' if inventory_complete is None else
                      str(len(products - verified)) if inventory_complete else 'unknown (catalog discovery incomplete)')
@@ -2249,16 +2251,16 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--verify-only', action='store_true')
     mode.add_argument('--poll-only', action='store_true', help='Read existing job status and archive evidence; never submit')
-    parser.add_argument('--scope', choices=('all', 'priority', 'pilot', 'supplemental', 'transport_probe', 'pacing_probe', 'pacing_job_diagnostic', 'account_diagnostic', 'supplemental_probe', 'outlink_probe'), default='all')
+    parser.add_argument('--scope', choices=('all', 'priority', 'policies', 'pilot', 'supplemental', 'transport_probe', 'pacing_probe', 'pacing_job_diagnostic', 'account_diagnostic', 'supplemental_probe', 'outlink_probe'), default='all')
     parser.add_argument('--outlink-page', type=int, choices=range(1, 7), default=1, help='One frozen Shop All page; only used with outlink_probe')
     parser.add_argument('--state', default='.capture-state/pending.json')
     mode.add_argument('--inspect-state', action='store_true', help='Emit sanitized saved-state summary only; no network or state mutation')
     parser.add_argument('--budget', type=int, default=17400)
     parser.add_argument('--daily-batches', action='store_true',
-                        help='Use resumable shared-index batches for daily all/priority scope')
+                        help='Use resumable shared-index batches for daily all/priority/policies scope')
     args = parser.parse_args()
-    if args.daily_batches and args.scope not in ('all', 'priority'):
-        parser.error('--daily-batches requires all or priority scope')
+    if args.daily_batches and args.scope not in ('all', 'priority', 'policies'):
+        parser.error('--daily-batches requires all, priority or policies scope')
     if args.inspect_state:
         path = Path(args.state)
         try:
@@ -2292,7 +2294,7 @@ def main():
         row = runner.diagnose_saved_pacing_job()
         print('Read-only saved-job observation only; not capture coverage.')
         return 0 if row['state'] == 'diagnostic-observed' else 1
-    urls = [] if args.scope == 'supplemental' else [BASE + p for p in (['/pages/warranty-policy'] if args.scope == 'pilot' else PRIORITY)]
+    urls = [] if args.scope == 'supplemental' else [BASE + p for p in (POLICIES if args.scope == 'policies' else ['/pages/warranty-policy'] if args.scope == 'pilot' else PRIORITY)]
     if args.scope == 'transport_probe':
         urls = [TRANSPORT_PROBE]
     if args.scope == 'pacing_probe':
@@ -2319,20 +2321,25 @@ def main():
         run_daily = runner.run_daily_queue if args.daily_batches else runner.run_queue
         run_daily([BASE + p for p in PRIORITY], 'priority')
         run_daily([url for url in urls if is_product(url)], 'all')
-    elif args.scope == 'priority' and args.daily_batches:
+    elif args.scope in ('priority', 'policies') and args.daily_batches:
         runner.run_daily_queue(urls, args.scope)
     else:
         runner.run_queue(urls, args.scope)
     counts = {state: sum(r['state'] == state for r in runner.results) for state in sorted({r['state'] for r in runner.results})}
     summary = 'UTC date: %s\n\nResults: %s\n\nFull per-URL evidence is in capture-report.json.\n' % (timestamp(runner.since)[:8], json.dumps(counts))
     missing_priority = []
-    if args.scope in ('all', 'priority'):
-        coverage, missing_priority = daily_summary(urls, runner.results, runner.since, inventory_complete if args.scope == 'all' else None)
+    if args.scope in ('all', 'priority', 'policies'):
+        coverage, missing_priority = daily_summary(urls, runner.results, runner.since,
+            inventory_complete if args.scope == 'all' else None,
+            priority_paths=POLICIES if args.scope == 'policies' else None)
+        if args.scope == 'policies':
+            coverage = coverage.replace('not assessed (priority-only scope)', 'paused (policy/cart-only scope)')
+            summary += 'Scope: cart and 8 policy/legal pages; product reads/captures paused.\n'
         summary += coverage
     print(summary)
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         Path(os.environ['GITHUB_STEP_SUMMARY']).write_text(summary)
-    if args.scope in ('all', 'priority'):
+    if args.scope in ('all', 'priority', 'policies'):
         missing_products = False
         if args.daily_batches and args.scope == 'all':
             verified = {row['url'] for row in runner.results if row.get('state') == 'verified'

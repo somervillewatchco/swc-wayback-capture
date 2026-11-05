@@ -3258,6 +3258,61 @@ class DailyBatchPipelineTests(unittest.TestCase):
         print('PIPELINE_METRIC ' + json.dumps({'targets': len(targets), 'requests': len(self.calls),
             'posts': len(self.posts()), 'window_seconds': windows, 'finished_utc': timestamp(self.now)}))
 
+    def test_policy_scope_never_discovers_or_reads_products_and_reports_only_its_targets(self):
+        from capture import main, POLICIES
+        for i, path in enumerate(POLICIES):
+            self.jobs[BASE + path] = {'id': 'existing-' + str(i), 'at': self.since + 60}
+        # A saved product job/queue must remain untouched and never be polled.
+        self.r.state[self.product] = {'submitted_at': self.since, 'job_id': 'accepted-product'}
+        self.r.state['_queues'] = {'all:20261104:capture:daily-v2': {
+            'urls': [self.product], 'cursor': 0, 'results': [], 'complete': False}}
+        self.r.save()
+        with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--verify-only', '--state', 'state.json']), \
+                patch('capture.Client', return_value=self.c), patch('capture.discover') as discover_products, \
+                patch('capture.discover_supplemental') as discover_other, patch('builtins.print') as output:
+            self.assertEqual(main(), 0)
+        discover_products.assert_not_called()
+        discover_other.assert_not_called()
+        self.assertEqual(self.posts(), [])
+        replayed = [url.split('id_/', 1)[1] for url, data, _ in self.calls if 'id_/' in url]
+        self.assertEqual(set(replayed), {BASE + path for path in POLICIES})
+        self.assertEqual(len(POLICIES), 9)
+        self.assertNotIn(BASE + '/', replayed)
+        self.assertNotIn(BASE + '/pages/contact', replayed)
+        self.assertNotIn(BASE + '/pages/no-brand-affiliation', replayed)
+        self.assertFalse(any('/products/' in url for url, _, _ in self.calls))
+        state = json.loads(Path('state.json').read_text())
+        self.assertEqual(state[self.product]['job_id'], 'accepted-product')
+        self.assertEqual(state['_queues']['all:20261104:capture:daily-v2']['cursor'], 0)
+        self.assertIn('paused (policy/cart-only scope)', '\n'.join(str(x) for x in output.call_args_list))
+        from capture import operational_summary
+        self.assertTrue(any(q['key'].startswith('policies:') for q in operational_summary(state)['queues']))
+
+    def test_missing_policy_fails_even_when_every_other_policy_is_verified(self):
+        from capture import main, POLICIES
+        for i, path in enumerate(POLICIES):
+            if path != '/cart':
+                self.jobs[BASE + path] = {'id': 'existing-' + str(i), 'at': self.since + 60}
+        with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--verify-only', '--state', 'state.json']), \
+                patch('capture.Client', return_value=self.c):
+            self.assertEqual(main(), 1)
+        self.assertEqual(self.posts(), [])
+
+    def test_policy_retry_preserves_verified_work_and_only_submits_missing_targets(self):
+        from capture import POLICIES
+        targets = [BASE + path for path in POLICIES]
+        for i, url in enumerate(targets[:-1]):
+            self.jobs[url] = {'id': 'existing-' + str(i), 'at': self.since + 60}
+        self.r.verify_only = True
+        self.r.run_daily_queue(targets, 'policies')
+        self.assertEqual(self.posts(), [])
+        self.advance(8 * 3600)
+        os.environ['GITHUB_RUN_ID'] = '50001'
+        self.restart(budget=19800)
+        self.r.run_daily_queue(targets, 'policies')
+        self.assertEqual([url for url, _ in self.posts()], [BASE + '/cart'])
+        self.assertEqual(self.verified(), set(targets))
+
     def test_incomplete_index_stops_all_later_work_without_submission(self):
         self.index_unavailable = True
         self.r.run_daily_queue([URL], 'priority')
@@ -3393,6 +3448,85 @@ class DailyBatchPipelineTests(unittest.TestCase):
                 patch('capture.Client', return_value=self.c), patch('capture.discover', return_value=[self.product]):
             self.assertEqual(main(), 1)
         self.assertEqual(self.posts(), [])
+
+
+class PolicyScheduleTests(unittest.TestCase):
+    def primary(self, **changes):
+        from capture_schedule import PRIMARY_TITLE
+        row = {'id': 123, 'event': 'schedule', 'head_branch': 'main',
+               'display_title': PRIMARY_TITLE, 'created_at': '2026-11-05T09:01:00Z',
+               'status': 'completed', 'conclusion': 'failure'}
+        row.update(changes)
+        return row
+
+    def test_retry_only_for_same_day_failed_primary(self):
+        import datetime as dt
+        from capture_schedule import retry_decision
+        today = dt.date(2026, 11, 5)
+        cases = [({}, True), ({'conclusion': 'timed_out'}, True),
+                 ({'conclusion': 'success'}, False), ({'conclusion': 'cancelled'}, False),
+                 ({'status': 'in_progress', 'conclusion': None}, False),
+                 ({'status': 'queued', 'conclusion': None}, False),
+                 ({'created_at': '2026-11-04T09:01:00Z'}, False),
+                 ({'display_title': 'Cart and policies - retry'}, False),
+                 ({'event': 'workflow_dispatch'}, False), ({'head_branch': 'other'}, False)]
+        for changes, expected in cases:
+            with self.subTest(changes=changes):
+                self.assertEqual(retry_decision([self.primary(**changes)], today)[0], expected)
+        self.assertFalse(retry_decision([], today)[0])
+
+    def test_latest_primary_success_prevents_retry_of_older_failure(self):
+        import datetime as dt
+        from capture_schedule import retry_decision
+        runs = [self.primary(), self.primary(id=124, created_at='2026-11-05T10:00:00Z', conclusion='success')]
+        self.assertFalse(retry_decision(runs, dt.date(2026, 11, 5))[0])
+
+    def test_primary_manual_and_superseded_schedule_gate_without_network(self):
+        from capture_schedule import main, PRIMARY_CRON
+        with tempfile.TemporaryDirectory() as temp:
+            for event, cron, expected in [('schedule', PRIMARY_CRON, True), ('workflow_dispatch', '', True),
+                                           ('schedule', '7 0,6,12,18 * * *', False)]:
+                output = Path(temp) / 'output'
+                output.write_text('')
+                with patch.dict(os.environ, {'GITHUB_EVENT_NAME': event, 'SCHEDULE': cron,
+                        'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': ''}), \
+                        patch('capture_schedule.urllib.request.urlopen') as request:
+                    self.assertEqual(main(), 0)
+                request.assert_not_called()
+                self.assertEqual(output.read_text(), 'run_capture=' + str(expected).lower() + '\n')
+
+    def test_retry_api_failure_never_authorizes_capture(self):
+        from capture_schedule import main, RETRY_CRON
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / 'output'
+            with patch.dict(os.environ, {'GITHUB_EVENT_NAME': 'schedule', 'SCHEDULE': RETRY_CRON,
+                    'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_TOKEN': 'test',
+                    'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': ''}), \
+                    patch('capture_schedule.urllib.request.urlopen', side_effect=OSError('unavailable')):
+                with self.assertRaises(OSError):
+                    main()
+            self.assertFalse(output.exists())
+
+    def test_retry_reads_github_once_and_exports_decision(self):
+        import datetime as dt
+        from capture_schedule import main, RETRY_CRON
+        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        with tempfile.TemporaryDirectory() as temp:
+            for conclusion, expected in [('failure', True), ('success', False)]:
+                output = Path(temp) / 'output'
+                output.write_text('')
+                response = Mock()
+                response.__enter__ = Mock(return_value=response)
+                response.__exit__ = Mock(return_value=False)
+                response.read.return_value = json.dumps({'workflow_runs': [
+                    self.primary(created_at=today + 'T09:00:00Z', conclusion=conclusion)]}).encode()
+                with patch.dict(os.environ, {'GITHUB_EVENT_NAME': 'schedule', 'SCHEDULE': RETRY_CRON,
+                        'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_TOKEN': 'test',
+                        'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': ''}), \
+                        patch('capture_schedule.urllib.request.urlopen', return_value=response) as request:
+                    self.assertEqual(main(), 0)
+                self.assertEqual(request.call_count, 1)
+                self.assertEqual(output.read_text(), 'run_capture=' + str(expected).lower() + '\n')
 
 
 if __name__ == '__main__': unittest.main()

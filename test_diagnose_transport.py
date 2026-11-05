@@ -108,9 +108,9 @@ class DiagnosticTests(unittest.TestCase):
 
     def test_workflow_diagnostic_never_enters_capture_cache_steps(self):
         workflow = (Path(__file__).resolve().parent / '.github/workflows/wayback-snapshot.yml').read_text()
-        self.assertIn("if: ${{ !inputs.diagnostic }}\n        env:\n          ARCHIVE_ORG_ACCESS_KEY", workflow)
-        self.assertIn('Restore unresolved jobs and host cooldown\n        if: ${{ !inputs.diagnostic }}', workflow)
-        self.assertIn('Preserve unresolved jobs even when verification fails\n        if: ${{ always() && !inputs.diagnostic }}', workflow)
+        self.assertIn("if: ${{ steps.schedule_gate.outputs.run_capture == 'true' && !inputs.diagnostic }}\n        env:\n          ARCHIVE_ORG_ACCESS_KEY", workflow)
+        self.assertIn("Restore unresolved jobs and host cooldown\n        if: ${{ steps.schedule_gate.outputs.run_capture == 'true' && !inputs.diagnostic }}", workflow)
+        self.assertIn("Preserve unresolved jobs even when verification fails\n        if: ${{ always() && steps.schedule_gate.outputs.run_capture == 'true' && !inputs.diagnostic }}", workflow)
         diagnostic = workflow.split('      - name: Public read-only transport diagnostics\n', 1)[1].split('      - name:', 1)[0]
         self.assertNotIn('ARCHIVE_ORG', diagnostic)
         self.assertNotIn('capture.py', diagnostic)

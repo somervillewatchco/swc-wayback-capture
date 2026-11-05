@@ -1,3 +1,49 @@
+# Temporary cart and policy schedule
+
+Authorized by the user November 5, 2026 UTC (November 4 Eastern): pause all
+product-page reads/captures while cart and policy captures are stabilized.
+This temporary scope/schedule supersedes the all-page operation described in
+the original release record below. Product resumption needs a reviewed decision
+based on reliable policy/cart coverage; it does not happen automatically.
+
+The existing workflow now offers:
+
+- Primary: **4 a.m. EST daily**, cron `0 9 * * *` UTC.
+- One retry opportunity: **noon EST**, cron `0 17 * * *` UTC, only when that
+  UTC day's latest scheduled primary has completed with failure, timed_out or
+  startup_failure. Success, cancellation, unfinished/missing primary, API errors
+  and superseded schedules never authorize retry capture. GitHub may delay starts.
+- Scope forced to `policies` for both scheduled and manual capture paths. No
+  product discovery, product replay/status lookup or product capture is performed.
+  Product jobs, queues and prior evidence remain saved.
+- Retry gate runs in this same serialized workflow; it adds no monitor or manual
+  dispatch. It reads GitHub run metadata using the read-only Actions permission.
+- The existing 330-minute capture budget, 120-second completion-based request
+  gate, host cooldowns, pause breaker, duplicate safeguards, strict verification
+  and state/evidence preservation remain. Same-day verified targets carry forward;
+  any missing target still makes the capture attempt fail. Products are reported
+  as paused rather than as zero missing.
+
+Exact temporary target list (all on https://somervillewatchco.com):
+
+1. /policies/refund-policy
+2. /policies/shipping-policy
+3. /policies/terms-of-service
+4. /policies/privacy-policy
+5. /policies/contact-information
+6. /policies/legal-notice
+7. /pages/warranty-policy
+8. /policies/subscription-policy
+9. /cart
+
+Offline validation covers a saved product job/queue remaining untouched, no
+product discovery or replay reads, all nine policy/cart pages verified, missing
+cart failure, retry of only missing targets, and retry gating across successful,
+failed, canceled, unfinished, absent and prior-day primary runs. Provider crawl
+restrictions remain unresolved until actual usable captures demonstrate recovery.
+
+---
+
 # Daily archival repair
 
 Prepared November 4, 2026, against main

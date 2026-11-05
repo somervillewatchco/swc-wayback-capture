@@ -1,14 +1,17 @@
 name: Daily Wayback Machine Policy Snapshot
+run-name: Cart and policies - ${{ github.event_name == 'schedule' && (github.event.schedule == '0 17 * * *' && 'retry' || 'primary') || 'manual' }}
 on:
   schedule:
-    - cron: '7 0,6,12,18 * * *'
+    # Fixed EST (UTC-5): daily primary at 4 a.m.; retry at noon only after failure.
+    - cron: '0 9 * * *'
+    - cron: '0 17 * * *'
   workflow_dispatch:
     inputs:
       scope:
-        description: 'Capture scope (supplemental = sitemap pages outside all-scope inventory)'
+        description: 'Temporary cart/policy-only capture; product page reads are paused'
         type: choice
-        options: [pilot, priority, all, supplemental, transport_probe, pacing_probe, pacing_job_diagnostic, account_diagnostic, supplemental_probe, outlink_probe]
-        default: pilot
+        options: [policies]
+        default: policies
       outlink_page:
         description: 'Single Shop All outlink page (only for outlink_probe; never a bulk loop)'
         type: choice
@@ -28,6 +31,7 @@ on:
         default: ''
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: wayback-snapshot
   cancel-in-progress: false
@@ -46,25 +50,31 @@ jobs:
           trap 'rm -rf "$test_dir"' EXIT
           cd "$test_dir"
           env -u GITHUB_STEP_SUMMARY PYTHONPATH="$GITHUB_WORKSPACE" python -m unittest -v test_capture test_diagnose_transport
+      - name: Gate the failure-only scheduled retry
+        id: schedule_gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: python capture_schedule.py
       - name: Restore unresolved jobs and host cooldown
-        if: ${{ !inputs.diagnostic }}
+        if: ${{ steps.schedule_gate.outputs.run_capture == 'true' && !inputs.diagnostic }}
         uses: actions/cache/restore@v4
         with:
           path: .capture-state
           key: ${{ inputs.recovery_cache_key || format('wayback-state-v1-{0}-{1}', github.run_id, github.run_attempt) }}
           restore-keys: ${{ !inputs.recovery_cache_key && 'wayback-state-v1-' || '' }}
       - name: Capture and independently verify
-        if: ${{ !inputs.diagnostic }}
+        if: ${{ steps.schedule_gate.outputs.run_capture == 'true' && !inputs.diagnostic }}
         env:
           ARCHIVE_ORG_ACCESS_KEY: ${{ secrets.ARCHIVE_ORG_ACCESS_KEY }}
           ARCHIVE_ORG_SECRET_KEY: ${{ secrets.ARCHIVE_ORG_SECRET_KEY }}
           RECOVERY_CACHE_KEY: ${{ inputs.recovery_cache_key }}
           OUTLINK_PAGE: ${{ inputs.outlink_page || '1' }}
-          SCOPE: ${{ inputs.scope || 'all' }}
+          SCOPE: policies
           VERIFY_ONLY: ${{ inputs.verify_only && 'true' || 'false' }}
         run: |
           args=(--scope "$SCOPE" --outlink-page "$OUTLINK_PAGE")
-          if [[ "$SCOPE" == all || "$SCOPE" == priority ]]; then
+          if [[ "$SCOPE" == policies ]]; then
             args+=(--daily-batches --budget 19800)
           fi
           if [[ -n "$RECOVERY_CACHE_KEY" ]]; then
@@ -74,13 +84,13 @@ jobs:
           fi
           python capture.py "${args[@]}"
       - name: Preserve unresolved jobs even when verification fails
-        if: ${{ always() && !inputs.diagnostic }}
+        if: ${{ always() && steps.schedule_gate.outputs.run_capture == 'true' && !inputs.diagnostic }}
         uses: actions/cache/save@v4
         with:
           path: .capture-state
           key: ${{ inputs.recovery_cache_key && 'wayback-recovery-v1' || 'wayback-state-v1' }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Publish per-URL evidence
-        if: ${{ always() && !inputs.diagnostic }}
+        if: ${{ always() && steps.schedule_gate.outputs.run_capture == 'true' && !inputs.diagnostic }}
         uses: actions/upload-artifact@v4
         with:
           name: capture-evidence-${{ github.run_id }}-${{ github.run_attempt }}
