@@ -3288,6 +3288,40 @@ class DailyBatchPipelineTests(unittest.TestCase):
         from capture import operational_summary
         self.assertTrue(any(q['key'].startswith('policies:') for q in operational_summary(state)['queues']))
 
+    def test_policy_main_spaces_all_saves_at_least_fifteen_minutes(self):
+        from capture import main, POLICIES
+        started = self.now
+        with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--budget', '19800', '--state', 'state.json']), \
+                patch('capture.Client', return_value=self.c), patch('builtins.print'):
+            self.assertEqual(main(), 0)
+        posts = self.posts()
+        self.assertEqual({url for url, _ in posts}, {BASE + path for path in POLICIES})
+        self.assertEqual(len(posts), 9)
+        self.assertTrue(all(b[1] - a[1] >= 900 for a, b in zip(posts, posts[1:])))
+        self.assertLess(self.now - started, 19800)
+        state = json.loads(Path('state.json').read_text())
+        self.assertGreaterEqual(state['_next_submit'], posts[-1][1] + 900)
+        self.assertFalse(any('/products/' in url for url, _, _ in self.calls))
+
+    def test_policy_save_spacing_survives_a_short_run_and_restart(self):
+        from capture import main
+        with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--budget', '1000', '--state', 'state.json']), \
+                patch('capture.Client', return_value=self.c), patch('builtins.print'):
+            self.assertEqual(main(), 1)
+        self.assertEqual(len(self.posts()), 1)
+        first = self.posts()[0][1]
+        state = json.loads(Path('state.json').read_text())
+        self.assertGreaterEqual(state['_next_submit'], first + 900)
+        self.advance(60)
+        os.environ['GITHUB_RUN_ID'] = '50002'
+        with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--budget', '19800', '--state', 'state.json']), \
+                patch('capture.Client', return_value=self.c), patch('builtins.print'):
+            self.assertEqual(main(), 0)
+        posts = self.posts()
+        self.assertEqual(len(posts), 9)
+        self.assertEqual(len({url for url, _ in posts}), 9)
+        self.assertTrue(all(b[1] - a[1] >= 900 for a, b in zip(posts, posts[1:])))
+
     def test_missing_policy_fails_even_when_every_other_policy_is_verified(self):
         from capture import main, POLICIES
         for i, path in enumerate(POLICIES):
