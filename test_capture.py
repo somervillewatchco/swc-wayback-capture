@@ -3288,20 +3288,32 @@ class DailyBatchPipelineTests(unittest.TestCase):
         from capture import operational_summary
         self.assertTrue(any(q['key'].startswith('policies:') for q in operational_summary(state)['queues']))
 
-    def test_policy_main_spaces_all_saves_at_least_fifteen_minutes(self):
+    def test_policy_hourly_saves_complete_across_primary_and_retry(self):
         from capture import main, POLICIES
-        started = self.now
+        self.now = self.since + 9 * 3600  # 4 a.m. EST primary.
+        with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--budget', '19800', '--state', 'state.json']), \
+                patch('capture.Client', return_value=self.c), patch('builtins.print'):
+            self.assertEqual(main(), 1)  # Nine hourly saves cannot fit in one 5.5-hour run.
+        primary_posts = self.posts()
+        self.assertGreater(len(primary_posts), 0)
+        self.assertLess(len(primary_posts), 9)
+        state = json.loads(Path('state.json').read_text())
+        self.assertGreaterEqual(state['_next_submit'], primary_posts[-1][1] + 3600)
+        self.now = self.since + 17 * 3600  # Existing noon EST failure-only retry.
+        os.environ['GITHUB_RUN_ID'] = '50003'
         with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--budget', '19800', '--state', 'state.json']), \
                 patch('capture.Client', return_value=self.c), patch('builtins.print'):
             self.assertEqual(main(), 0)
         posts = self.posts()
         self.assertEqual({url for url, _ in posts}, {BASE + path for path in POLICIES})
         self.assertEqual(len(posts), 9)
-        self.assertTrue(all(b[1] - a[1] >= 900 for a, b in zip(posts, posts[1:])))
-        self.assertLess(self.now - started, 19800)
+        self.assertTrue(all(b[1] - a[1] >= 3600 for a, b in zip(posts, posts[1:])))
+        self.assertLess(self.now, self.since + 86400)
         state = json.loads(Path('state.json').read_text())
-        self.assertGreaterEqual(state['_next_submit'], posts[-1][1] + 900)
+        self.assertGreaterEqual(state['_next_submit'], posts[-1][1] + 3600)
         self.assertFalse(any('/products/' in url for url, _, _ in self.calls))
+        print('HOURLY_POLICY_METRIC ' + json.dumps({'primary_saves': len(primary_posts),
+            'total_saves': len(posts), 'finished_utc': timestamp(self.now)}))
 
     def test_policy_save_spacing_survives_a_short_run_and_restart(self):
         from capture import main
@@ -3311,16 +3323,16 @@ class DailyBatchPipelineTests(unittest.TestCase):
         self.assertEqual(len(self.posts()), 1)
         first = self.posts()[0][1]
         state = json.loads(Path('state.json').read_text())
-        self.assertGreaterEqual(state['_next_submit'], first + 900)
+        self.assertGreaterEqual(state['_next_submit'], first + 3600)
         self.advance(60)
         os.environ['GITHUB_RUN_ID'] = '50002'
-        with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--budget', '19800', '--state', 'state.json']), \
+        with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--budget', '5000', '--state', 'state.json']), \
                 patch('capture.Client', return_value=self.c), patch('builtins.print'):
-            self.assertEqual(main(), 0)
+            self.assertEqual(main(), 1)
         posts = self.posts()
-        self.assertEqual(len(posts), 9)
-        self.assertEqual(len({url for url, _ in posts}), 9)
-        self.assertTrue(all(b[1] - a[1] >= 900 for a, b in zip(posts, posts[1:])))
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(len({url for url, _ in posts}), 2)
+        self.assertTrue(all(b[1] - a[1] >= 3600 for a, b in zip(posts, posts[1:])))
 
     def test_missing_policy_fails_even_when_every_other_policy_is_verified(self):
         from capture import main, POLICIES

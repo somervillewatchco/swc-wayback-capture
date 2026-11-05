@@ -2279,7 +2279,7 @@ def main():
     budget = min(args.budget, 1800) if args.scope in ('pacing_probe', 'pacing_job_diagnostic', 'account_diagnostic', 'supplemental_probe', 'outlink_probe') else args.budget
     try:
         runner = Runner(client, args.state, budget,
-                        interval=900 if args.scope == 'policies' else 60,
+                        interval=3600 if args.scope == 'policies' else 60,
                         verify_only=args.verify_only, poll_only=args.poll_only)
     except StateContinuityError as exc:
         print(json.dumps({'state': 'state-held', 'reason': str(exc), 'network_requests': 0}), flush=True)
