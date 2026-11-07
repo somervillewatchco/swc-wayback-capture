@@ -13,6 +13,7 @@ RETRY_CRON = '0 21 * * *'
 
 def retry_decision(runs, today):
     candidates = []
+    previous = []
     for run in runs:
         if (run.get('event') != 'schedule' or run.get('head_branch') != 'main'
                 or run.get('display_title') != PRIMARY_TITLE):
@@ -20,6 +21,14 @@ def retry_decision(runs, today):
         created = dt.datetime.fromisoformat(run['created_at'].replace('Z', '+00:00'))
         if created.date() == today:
             candidates.append(run)
+        elif created.date() == today - dt.timedelta(days=1):
+            previous.append(run)
+    if not candidates and previous:
+        latest = max(previous, key=lambda row: (row['created_at'], row['id']))
+        if (latest.get('status') == 'completed'
+                and latest.get('conclusion') in ('failure', 'timed_out', 'startup_failure')):
+            return False, ('Missed retry: previous UTC day has a failed primary, but its coverage day has ended; '
+                           'no capture authorized. Daily coverage is unresolved.')
     if not candidates:
         return False, 'No primary run recorded for this UTC day; retry skipped.'
     primary = max(candidates, key=lambda row: (row['created_at'], row['id']))
@@ -52,7 +61,9 @@ def main():
         with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
             summary.write('Schedule decision: ' + reason + '\n')
     print(reason)
-    return 0
+    # A late failed-day continuation is a missed coverage opportunity, not a
+    # successful archive run. Keep the cutoff; never backdate a new submission.
+    return 1 if reason.startswith('Missed retry:') else 0
 
 
 if __name__ == '__main__':

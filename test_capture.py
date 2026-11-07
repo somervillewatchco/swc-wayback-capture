@@ -3496,6 +3496,105 @@ class DailyBatchPipelineTests(unittest.TestCase):
         self.assertEqual(self.posts(), [])
 
 
+    def test_transient_shared_lookup_recovers_without_duplicate_or_unpaced_saves(self):
+        normal = self.c._request.side_effect
+        failures = [0]
+        def unavailable_twice(url, data=None, authenticated=False):
+            if '/cdx/' in url and failures[0] < 2:
+                failures[0] += 1
+                self.calls.append((url, data, self.now))
+                self.now += 2
+                return 503, {'Retry-After': '1800'}, 'upstream SECRET', url
+            return normal(url, data, authenticated)
+        self.c._request.side_effect = unavailable_twice
+        self.r.interval = 3600
+        self.r.run_daily_queue([URL, BASE + '/cart'], 'policies')
+        self.assertEqual(self.verified(), {URL, BASE + '/cart'})
+        self.assertEqual(len(self.posts()), 2)
+        self.assertGreaterEqual(self.posts()[1][1] - self.posts()[0][1], 3600)
+        self.assertGreaterEqual(self.calls[2][2] - self.calls[1][2], 1802)
+        detail = next(r['lookup_failure'] for r in self.r.results if 'lookup_failure' in r)
+        self.assertEqual(detail['http_status'], 503)
+        self.assertEqual(detail['phase'], 'index')
+        self.assertEqual(detail['reason'], 'non_json_response')
+        self.assertNotIn('SECRET', json.dumps(self.r.results))
+
+    def test_persistent_lookup_transport_failure_is_bounded_and_diagnostic(self):
+        def offline(url, data=None, authenticated=False):
+            self.calls.append((url, data, self.now))
+            self.now += 2
+            raise LookupFailure('SECRET raw URL/token', transport={
+                'phase': 'tcp_connect', 'reason_class': 'ConnectionRefusedError',
+                'errno': 111, 'known_not_sent': True, 'message': 'SECRET'})
+        self.c._request.side_effect = offline
+        self.r.state[URL] = {'job_id': 'retained-job', 'submitted_at': self.since}
+        self.r.save()
+        self.r.run_daily_queue([URL], 'policies')
+        self.assertEqual(len(self.calls), 6)  # 3 rounds x existing 2 GET attempts.
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(self.r.state[URL]['job_id'], 'retained-job')
+        detail = next(r['lookup_failure'] for r in self.r.results if 'lookup_failure' in r)
+        self.assertEqual(detail['reason_class'], 'ConnectionRefusedError')
+        self.assertEqual(detail['errno'], 111)
+        self.assertNotIn('SECRET', json.dumps(self.r.results))
+
+    def test_malformed_index_reports_reason_without_retry_or_submission(self):
+        self.index_unavailable = True
+        self.r.run_daily_queue([URL], 'policies')
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.posts(), [])
+        detail = self.r.results[0]['lookup_failure']
+        self.assertEqual(detail['reason'], 'incomplete_cdx_row')
+        self.assertEqual(detail['http_status'], 200)
+        self.assertFalse(detail['retryable'])
+
+    def test_lookup_retry_respects_three_pause_breaker_and_long_retry_after(self):
+        for retry_after, expected_calls in [('1200', 3), ('86400', 1)]:
+            with self.subTest(retry_after=retry_after):
+                self.c._request.side_effect = lambda url, data=None, authenticated=False: (
+                    self.calls.append((url, data, self.now)) or
+                    (429, {'Retry-After': retry_after}, '{}', url))
+                # New isolated clock/state for each case.
+                self.calls.clear()
+                self.r.state['_pause_responses'] = {'run': self.r.run_key, 'count': 0}
+                self.r.state['_archive_next_request_at'] = 0
+                self.r.save()
+                self.now = self.since + 420
+                self.restart()
+                self.r.run_daily_queue([URL], 'policies')
+                self.assertEqual(len(self.calls), expected_calls)
+                self.assertEqual(self.posts(), [])
+                self.assertFalse(self.verified())
+
+    def test_transient_replay_failure_never_authorizes_a_new_save(self):
+        self.jobs[URL] = {'id': 'already-captured', 'at': self.since + 60}
+        normal = self.c._request.side_effect
+        def failing_replay(url, data=None, authenticated=False):
+            if 'id_/' in url:
+                self.calls.append((url, data, self.now))
+                self.now += 2
+                return 503, {}, 'unavailable', url
+            return normal(url, data, authenticated)
+        self.c._request.side_effect = failing_replay
+        self.r.run_daily_queue([URL], 'policies')
+        self.assertEqual(self.posts(), [])
+        self.assertFalse(self.verified())
+        detail = next(r['lookup_failure'] for r in self.r.results if 'lookup_failure' in r)
+        self.assertEqual(detail['phase'], 'replay')
+        self.assertEqual(detail['http_status'], 503)
+
+    def test_lookup_retry_cannot_cross_utc_day(self):
+        self.now = self.since + 86400 - 600
+        self.restart()
+        self.c._request.side_effect = lambda url, data=None, authenticated=False: (
+            self.calls.append((url, data, self.now)) or (503, {}, '{}', url))
+        self.r.run_daily_queue([URL], 'policies')
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.posts(), [])
+        self.assertTrue(all(at < self.since + 86400 for _, _, at in self.calls))
+        self.assertFalse(self.r.results[0]['lookup_retry_scheduled'])
+
+
 class PolicyScheduleTests(unittest.TestCase):
     def primary(self, **changes):
         from capture_schedule import PRIMARY_TITLE
@@ -3574,6 +3673,35 @@ class PolicyScheduleTests(unittest.TestCase):
                     self.assertEqual(main(), 0)
                 self.assertEqual(request.call_count, 1)
                 self.assertEqual(output.read_text(), 'run_capture=' + str(expected).lower() + '\n')
+
+
+    def test_delayed_retry_after_midnight_reports_failure_without_capture(self):
+        import datetime as dt
+        from capture_schedule import main, RETRY_CRON
+        yesterday = (dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)).isoformat()
+        with tempfile.TemporaryDirectory() as temp:
+            output, summary = Path(temp) / 'output', Path(temp) / 'summary'
+            response = Mock()
+            response.__enter__ = Mock(return_value=response)
+            response.__exit__ = Mock(return_value=False)
+            response.read.return_value = json.dumps({'workflow_runs': [
+                self.primary(created_at=yesterday + 'T16:40:37Z')]}).encode()
+            with patch.dict(os.environ, {'GITHUB_EVENT_NAME': 'schedule', 'SCHEDULE': RETRY_CRON,
+                    'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_TOKEN': 'test',
+                    'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': str(summary)}), \
+                    patch('capture_schedule.urllib.request.urlopen', return_value=response):
+                self.assertEqual(main(), 1)
+            self.assertEqual(output.read_text(), 'run_capture=false\n')
+            self.assertIn('Missed retry:', summary.read_text())
+
+
+    def test_previous_day_failure_superseded_by_success_is_not_a_missed_retry(self):
+        import datetime as dt
+        from capture_schedule import retry_decision
+        runs = [self.primary(), self.primary(id=124, created_at='2026-11-05T10:00:00Z', conclusion='success')]
+        allowed, reason = retry_decision(runs, dt.date(2026, 11, 6))
+        self.assertFalse(allowed)
+        self.assertFalse(reason.startswith('Missed retry:'))
 
 
 if __name__ == '__main__': unittest.main()

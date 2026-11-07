@@ -321,9 +321,53 @@ def operational_summary(state):
             'coverage_note': 'Queue progress and health probes are not capture coverage.'}
 
 class LookupFailure(Exception):
-    def __init__(self, message, transport=None):
+    def __init__(self, message, transport=None, evidence=None):
         super().__init__(message)
         self.transport = transport
+        self.evidence = evidence or {}
+
+
+def lookup_failure_evidence(exc, phase, http_status=None):
+    """Known local reasons and scalar metadata only; never raw server text."""
+    reasons = {
+        'CDX unavailable': 'cdx_unavailable',
+        'Invalid CDX schema': 'invalid_cdx_schema',
+        'Incomplete CDX row': 'incomplete_cdx_row',
+        'Invalid CDX field': 'invalid_cdx_field',
+        'Invalid CDX timestamp': 'invalid_cdx_timestamp',
+        'Invalid CDX timestamp or original URL': 'invalid_cdx_identity',
+        'Invalid CDX status code': 'invalid_cdx_status',
+        'Invalid CDX MIME type': 'invalid_cdx_mime',
+        'Shared CDX response reached its bounded row limit': 'cdx_row_limit',
+        'Response exceeds verification size limit': 'response_size_limit',
+        'Replay temporarily unavailable': 'replay_unavailable',
+    }
+    reason = reasons.get(str(exc), 'unclassified_lookup_failure')
+    if re.fullmatch(r'Non-JSON response \(HTTP [1-5][0-9]{2}\)', str(exc)):
+        reason = 'non_json_response'
+    if isinstance(exc, RequestDeferred):
+        reason = 'local_request_deferred'
+    detail = {'phase': phase, 'endpoint': 'shared_cdx' if phase == 'index' else 'exact_replay',
+              'reason': reason, 'error_class': type(exc).__name__}
+    observed = getattr(exc, 'evidence', {}).get('http_status', http_status)
+    if type(observed) is int and 100 <= observed <= 599:
+        detail['http_status'] = observed
+    transport = getattr(exc, 'transport', None) or {}
+    if transport:
+        detail['reason'] = 'transport_failure'
+        if transport.get('phase') in ('tcp_connect', 'open', 'read', 'decode'):
+            detail['transport_phase'] = transport['phase']
+        if transport.get('reason_class') in ('TimeoutError', 'ConnectionRefusedError',
+                'ConnectionResetError', 'ConnectionAbortedError', 'RemoteDisconnected',
+                'IncompleteRead', 'gaierror', 'OSError', 'SSLError', 'SSLCertVerificationError'):
+            detail['reason_class'] = transport['reason_class']
+        if type(transport.get('errno')) is int and abs(transport['errno']) < 10000:
+            detail['errno'] = transport['errno']
+    detail['retryable'] = (not isinstance(exc, RequestDeferred) and (
+        observed in (429, 502, 503, 504) or detail.get('reason_class') in (
+            'TimeoutError', 'ConnectionRefusedError', 'ConnectionResetError',
+            'ConnectionAbortedError', 'RemoteDisconnected', 'IncompleteRead', 'gaierror')))
+    return detail
 
 
 class RequestDeferred(LookupFailure):
@@ -445,6 +489,7 @@ class Client:
     def request(self, url, data=None, authenticated=False):
         is_archive = up.urlsplit(url).hostname == 'web.archive.org'
         last_safe_failure = None
+        previous_read_status = None
         for attempt in range(2):
             if data is None and is_archive and not self.archive_interval:
                 wait = max(0, getattr(self, '_last_read', 0) + 2 - time.time())
@@ -454,13 +499,16 @@ class Client:
             try:
                 response = self.paced_request(url, data, authenticated, attempt=attempt + 1)
                 if data is None and not authenticated and response[0] in (429, 502, 503, 504) and attempt == 0:
+                    previous_read_status = response[0]
                     if not (is_archive and self.archive_interval):
                         time.sleep(30)
                     continue
                 if is_archive and 200 <= response[0] < 400:
                     self.archive_healthy_responses += 1
                 return response
-            except RequestDeferred:
+            except RequestDeferred as exc:
+                if previous_read_status is not None:
+                    exc.evidence['http_status'] = previous_read_status
                 if last_safe_failure is not None:
                     raise last_safe_failure  # No second dispatch: retain first proof.
                 raise  # Never turn a local budget decision into another attempt.
@@ -505,12 +553,14 @@ class Client:
         else:
             handlers.append(NoRedirectIntoArchive())
         phase = 'open'
+        observed_status = None
         try:
             try:
                 response = ur.build_opener(*handlers).open(req, timeout=30)
             except urllib.error.HTTPError as exc:
                 response = exc
             with response:
+                observed_status = response.status
                 if up.urlsplit(url).hostname in ('web.archive.org', 'archive.org'):
                     self.archive_observed_status = response.status
                     safe_headers = {k.lower(): v for k, v in response.headers.items()}
@@ -536,7 +586,8 @@ class Client:
             number = getattr(reason, 'errno', None)
             if isinstance(number, int):
                 detail['errno'] = number
-            raise LookupFailure('Network operation failed: ' + type(reason).__name__, transport=detail) from None
+            raise LookupFailure('Network operation failed: ' + type(reason).__name__, transport=detail,
+                                evidence={'http_status': observed_status}) from None
 
     def json(self, url, data=None, authenticated=False):
         status, headers, body, _ = self.request(url, data, authenticated)
@@ -548,7 +599,8 @@ class Client:
                 return status, {k.lower(): v for k, v in headers.items()}, {
                     'status': 'error' if status == 429 else 'unknown',
                     'status_ext': 'http-429' if status == 429 else 'overloaded'}
-            raise LookupFailure('Non-JSON response (HTTP %s)' % status) from None
+            raise LookupFailure('Non-JSON response (HTTP %s)' % status,
+                                evidence={'http_status': status}) from None
         return status, {k.lower(): v for k, v in headers.items()}, obj
 
     def verify(self, url, since, until=None):
@@ -566,7 +618,7 @@ class Client:
         Every positive result still needs an individual exact replay. A None
         result means only that this snapshot did not yield usable evidence;
         it is not proof that a pending or uncertain job can be resubmitted.
-        The capture scheduler does not use this proposal component yet.
+        The daily scheduler uses this before authorizing capture work.
         """
         if (not isinstance(urls, (list, tuple)) or len(urls) > 5000
                 or any(not isinstance(url, str) or not (
@@ -595,18 +647,24 @@ class Client:
             'filter': ['statuscode:2[0-9]{2}',
                        r'mimetype:(text/html|application/xhtml\+xml|warc/revisit)'],
             'limit': limit, 'showResumeKey': 'true'}, doseq=True)
-        status, _, data = self.json('https://web.archive.org/cdx/search/cdx?' + query)
-        if isinstance(data, list) and len(data) > limit:
-            raise LookupFailure('Shared CDX response reached its bounded row limit')
-        rows = self.cdx_rows(status, data)
-        # Validate every row before the first replay or emitted result, even
-        # when the malformed row is for a URL outside the supplied inventory.
-        by_url = {url: [] for url in targets}
-        for row, captured in rows:
-            if row['original'] in by_url:
-                by_url[row['original']].append((row, captured))
-        for url in targets:
-            yield url, self.verify_rows(url, since, upper, by_url[url])
+        phase, status = 'index', None
+        try:
+            status, _, data = self.json('https://web.archive.org/cdx/search/cdx?' + query)
+            if isinstance(data, list) and len(data) > limit:
+                raise LookupFailure('Shared CDX response reached its bounded row limit')
+            rows = self.cdx_rows(status, data)
+            # Validate every row before the first replay or emitted result, even
+            # when the malformed row is for a URL outside the supplied inventory.
+            by_url = {url: [] for url in targets}
+            for row, captured in rows:
+                if row['original'] in by_url:
+                    by_url[row['original']].append((row, captured))
+            for url in targets:
+                phase, status = 'replay', None
+                yield url, self.verify_rows(url, since, upper, by_url[url])
+        except (LookupFailure, ValueError, OSError) as exc:
+            exc.lookup_evidence = lookup_failure_evidence(exc, phase, status)
+            raise
 
     @staticmethod
     def cdx_rows(status, data):
@@ -663,6 +721,8 @@ class Client:
             code, headers, body, final = self.request(replay)
             if final != replay:
                 continue  # Never accept Wayback's redirect to a different capture/page.
+            if code in (429, 502, 503, 504):
+                raise LookupFailure('Replay temporarily unavailable', evidence={'http_status': code})
             lower = {k.lower(): v for k, v in headers.items()}
             if not 200 <= code < 300 or 'html' not in lower.get('content-type', '').lower() or not usable_html(body, url):
                 continue
@@ -1151,6 +1211,7 @@ class Runner:
         self.next_submit = self.state.get('_next_submit', 0)
         self.results = []
         self.transport_failure_streak = 0
+        self.lookup_retries = 0  # At most two extra verification rounds per invocation.
         self.transport_circuit_open = False
         run_key = os.environ.get('GITHUB_RUN_ID', '') + ':' + os.environ.get('GITHUB_RUN_ATTEMPT', '1')
         self.run_key = run_key if re.fullmatch(r'[0-9]+:[0-9]+', run_key) else None
@@ -1640,11 +1701,29 @@ class Runner:
                 except (LookupFailure, RequestDeferred, ValueError, OSError) as exc:
                     # Preserve phase/cursor and positive proof. No partial
                     # index is treated as permission for a new submission.
+                    detail = getattr(exc, 'lookup_evidence', None) or lookup_failure_evidence(exc, 'index')
+                    # Request-level retry already happened. Allow two additional
+                    # rounds for known transient failures, always behind every
+                    # existing pause, pacing, budget and UTC-day protection.
+                    ready = max(time.time() + 1200, self.client.archive_next_request_at,
+                                self.next_submit, self.state.get('_transport_cooldown_until', 0))
+                    retry = (detail['retryable'] and self.lookup_retries < 2
+                             and not self.pause_circuit_open and not self.transport_circuit_open
+                             and not self.client.archive_requests_stopped
+                             and ready + 120 < min(self.deadline, self.since + 86400))
                     for url in selection:
                         if not any(r.get('url') == url and r.get('state') == 'verified' for r in queue['results']):
                             self.result(url, 'deferred', reason='shared index/replay unavailable; batch checkpoint retained',
-                                        error_class=type(exc).__name__)
+                                        error_class=type(exc).__name__, lookup_failure=detail,
+                                        lookup_retry_scheduled=retry)
                     checkpoint()
+                    if retry:
+                        self.lookup_retries += 1
+                        self.client.archive_next_request_at = ready
+                        self.state['_archive_next_request_at'] = ready
+                        checkpoint()  # Persist the wait before sleeping or restarting.
+                        time.sleep(max(0, ready - time.time()))
+                        continue
                     break
                 if before and not self.verify_only:
                     queue['phase'] = 'capture'
