@@ -1127,7 +1127,7 @@ def validate_state(state):
                     if (queue.get('phase') not in ('index_before', 'capture', 'index_after')
                             or type(start) is not int or type(end) is not int
                             or not 0 <= start <= cursor <= end <= len(urls)
-                            or end - start > 8
+                            or end - start > (len(POLICIES) if qkey.startswith('policies:') else 8)
                             or (queue['phase'] == 'index_after' and cursor != end)
                             or (queue['complete'] and cursor != len(urls))):
                         _reject('Invalid daily batch checkpoint')
@@ -1426,7 +1426,7 @@ class Runner:
         pending['retry_eligible_at'] = max(attempt_day + 86400,
             pending.get('server_retry_after_until', 0))
         self.save()
-        return self.result(url, 'reused', reason='completed capture predates UTC day; no new submission in this run')
+        return self.result(url, 'reused', reason='completed capture predates UTC day; eligibility checked before any new submission')
 
     def process(self, url, *, shared_index=False):
         # A per-run circuit counts URL operations with exhausted Archive
@@ -1631,6 +1631,9 @@ class Runner:
             raise ValueError('Daily batches require all, priority or policies scope')
         mode = 'verify' if self.verify_only else 'poll' if self.poll_only else 'capture'
         prefix = scope + ':' + timestamp(self.since)[:8] + ':' + mode
+        # Keep the nine essential targets together: a failed post-batch index
+        # must not strand cart behind a second verification gate.
+        batch_size = len(POLICIES) if scope == 'policies' else 8
         key = prefix + ':daily-v3'
         queues = self.state.setdefault('_queues', {})
         queue = queues.get(key)
@@ -1655,7 +1658,7 @@ class Runner:
                 remaining.remove(retry)
                 remaining.insert(0, retry)
             queue = {'urls': remaining, 'cursor': 0, 'results': verified, 'complete': False,
-                     'phase': 'index_before', 'batch_start': 0, 'batch_end': min(8, len(remaining))}
+                     'phase': 'index_before', 'batch_start': 0, 'batch_end': min(batch_size, len(remaining))}
             queues[key] = queue
         else:
             # Newly discovered products join untouched work. Removed targets
@@ -1735,7 +1738,7 @@ class Runner:
                 queue.pop('started', None)
                 queue.pop('retry_same_url', None)
                 queue['batch_start'] = end
-                queue['batch_end'] = min(end + 8, len(queue['urls']))
+                queue['batch_end'] = min(end + batch_size, len(queue['urls']))
                 queue['phase'] = 'index_before'
                 queue['complete'] = end == len(queue['urls'])
                 checkpoint()
@@ -2112,7 +2115,15 @@ class Runner:
                 # read-only exact CDX/replay, without requiring a live job ID.
                 resolved = self.classify_success(url, pending, check_daily=False)
                 if resolved:
-                    return resolved
+                    eligible = (resolved.get('state') == 'reused'
+                                and pending.get('terminal_reused')
+                                and not (self.verify_only or self.poll_only)
+                                and time.time() >= pending['retry_eligible_at'])
+                    if not eligible:
+                        return resolved
+                    # Exact CDX/replay established completion, and the existing
+                    # retry date has already passed. Retire through the normal
+                    # audit path below instead of wasting another daily run.
             if self.verify_only:
                 return self.result(url, 'unverified', reason='no usable indexed capture for UTC day')
             if pending and pending.get('terminal_reused'):
@@ -2358,7 +2369,7 @@ def main():
     budget = min(args.budget, 1800) if args.scope in ('pacing_probe', 'pacing_job_diagnostic', 'account_diagnostic', 'supplemental_probe', 'outlink_probe') else args.budget
     try:
         runner = Runner(client, args.state, budget,
-                        interval=3600 if args.scope == 'policies' else 60,
+                        interval=600 if args.scope == 'policies' else 60,
                         verify_only=args.verify_only, poll_only=args.poll_only)
     except StateContinuityError as exc:
         print(json.dumps({'state': 'state-held', 'reason': str(exc), 'network_requests': 0}), flush=True)

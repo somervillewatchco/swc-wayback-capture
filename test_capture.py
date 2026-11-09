@@ -642,6 +642,45 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.r.state['_completed_jobs'][-1]['job_id'], 'saved-job')
         self.assertEqual(self.r.state[URL]['job_id'], 'new-job')
 
+    def test_newly_resolved_old_job_can_capture_when_existing_eligibility_passed(self):
+        self.old_success_state()
+        self.r.state[URL]['submitted_at'] = self.r.since - 86400
+        self.r.save()
+        self.c.json.side_effect = [(200, {}, {'job_id': 'new-job'})] + [(200, {}, {'status': 'pending'})] * 12
+        self.assertEqual(self.r.process(URL)['state'], 'pending')
+        posts = [c for c in self.c.json.call_args_list if c.args[0] == 'https://web.archive.org/save/']
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(self.r.state['_completed_jobs'][-1]['job_id'], 'saved-job')
+        self.assertEqual(self.r.state['_completed_jobs'][-1]['state'], 'reused_released')
+        self.assertEqual(self.r.state[URL]['job_id'], 'new-job')
+
+    def test_newly_resolved_old_job_read_only_or_cooldown_never_resubmits(self):
+        for mode in ('verify_only', 'poll_only', 'cooldown'):
+            with self.subTest(mode=mode):
+                self.old_success_state()
+                self.r.state[URL]['submitted_at'] = self.r.since - 86400
+                self.r.verify_only = mode == 'verify_only'
+                self.r.poll_only = mode == 'poll_only'
+                if mode == 'cooldown':
+                    self.r.state[URL]['server_retry_after_until'] = time.time() + 86400
+                self.r.save()
+                self.c.json.reset_mock()
+                self.assertEqual(self.r.process(URL)['state'], 'reused')
+                self.c.json.assert_not_called()
+                self.assertEqual(self.r.state[URL]['job_id'], 'saved-job')
+
+    def test_old_unknown_and_pending_jobs_are_not_released_by_age(self):
+        for job in (None, 'still-pending'):
+            with self.subTest(job=job):
+                self.r.state[URL] = {'submitted_at': self.r.since - 7 * 86400}
+                if job:self.r.state[URL]['job_id'] = job
+                self.r.save()
+                self.c.json.reset_mock()
+                self.c.json.return_value = (200, {}, {'status': 'pending'})
+                self.assertEqual(self.r.process(URL)['state'], 'pending')
+                self.assertFalse(any(c.args[0] == 'https://web.archive.org/save/' for c in self.c.json.call_args_list))
+                self.assertEqual(self.r.state[URL].get('job_id'), job)
+
     def test_terminal_reused_poll_only_never_releases_even_when_due(self):
         self.old_success_state(); self.r.process(URL)
         self.r.state[URL]['retry_eligible_at'] = self.r.since - 1
@@ -3288,32 +3327,40 @@ class DailyBatchPipelineTests(unittest.TestCase):
         from capture import operational_summary
         self.assertTrue(any(q['key'].startswith('policies:') for q in operational_summary(state)['queues']))
 
-    def test_policy_hourly_saves_complete_across_primary_and_retry(self):
+    def test_policy_ten_minute_saves_complete_in_one_primary(self):
         from capture import main, POLICIES
         self.now = self.since + 9 * 3600  # 4 a.m. EST primary.
-        with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--budget', '19800', '--state', 'state.json']), \
-                patch('capture.Client', return_value=self.c), patch('builtins.print'):
-            self.assertEqual(main(), 1)  # Nine hourly saves cannot fit in one 5.5-hour run.
-        primary_posts = self.posts()
-        self.assertGreater(len(primary_posts), 0)
-        self.assertLess(len(primary_posts), 9)
-        state = json.loads(Path('state.json').read_text())
-        self.assertGreaterEqual(state['_next_submit'], primary_posts[-1][1] + 3600)
-        self.now = self.since + 21 * 3600  # 4 p.m. EST failure-only retry.
-        os.environ['GITHUB_RUN_ID'] = '50003'
+        started = self.now
         with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--budget', '19800', '--state', 'state.json']), \
                 patch('capture.Client', return_value=self.c), patch('builtins.print'):
             self.assertEqual(main(), 0)
         posts = self.posts()
         self.assertEqual({url for url, _ in posts}, {BASE + path for path in POLICIES})
         self.assertEqual(len(posts), 9)
-        self.assertTrue(all(b[1] - a[1] >= 3600 for a, b in zip(posts, posts[1:])))
-        self.assertLess(self.now, self.since + 86400)
+        self.assertTrue(all(b[1] - a[1] >= 600 for a, b in zip(posts, posts[1:])))
+        self.assertLess(self.now - started, 19800)
         state = json.loads(Path('state.json').read_text())
-        self.assertGreaterEqual(state['_next_submit'], posts[-1][1] + 3600)
+        self.assertGreaterEqual(state['_next_submit'], posts[-1][1] + 600)
+        rows = json.loads(Path('capture-report.json').read_text())
+        self.assertEqual({r['url'] for r in rows if r['state'] == 'verified'},
+                         {BASE + path for path in POLICIES})
         self.assertFalse(any('/products/' in url for url, _, _ in self.calls))
-        print('HOURLY_POLICY_METRIC ' + json.dumps({'primary_saves': len(primary_posts),
-            'total_saves': len(posts), 'finished_utc': timestamp(self.now)}))
+        print('TEN_MINUTE_POLICY_METRIC ' + json.dumps({'total_saves': len(posts),
+            'elapsed_seconds': self.now - started, 'finished_utc': timestamp(self.now),
+            'minimum_save_gap': min(b[1] - a[1] for a, b in zip(posts, posts[1:]))}))
+
+    def test_policy_ten_minute_pacing_keeps_longer_persisted_cooldowns(self):
+        from capture import main
+        self.r.state['_next_submit'] = self.now + 3600  # Earlier hourly release.
+        provider_ready = self.now + 5400
+        self.r.state['_archive_next_request_at'] = provider_ready
+        self.r.save()
+        with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--budget', '19800', '--state', 'state.json']), \
+                patch('capture.Client', return_value=self.c), patch('builtins.print'):
+            self.assertEqual(main(), 0)
+        self.assertGreaterEqual(self.calls[0][2], provider_ready)
+        self.assertEqual(len(self.posts()), 9)
+        self.assertTrue(all(b[1] - a[1] >= 600 for a, b in zip(self.posts(), self.posts()[1:])))
 
     def test_policy_save_spacing_survives_a_short_run_and_restart(self):
         from capture import main
@@ -3323,16 +3370,16 @@ class DailyBatchPipelineTests(unittest.TestCase):
         self.assertEqual(len(self.posts()), 1)
         first = self.posts()[0][1]
         state = json.loads(Path('state.json').read_text())
-        self.assertGreaterEqual(state['_next_submit'], first + 3600)
+        self.assertGreaterEqual(state['_next_submit'], first + 600)
         self.advance(60)
         os.environ['GITHUB_RUN_ID'] = '50002'
-        with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--budget', '5000', '--state', 'state.json']), \
+        with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--budget', '19800', '--state', 'state.json']), \
                 patch('capture.Client', return_value=self.c), patch('builtins.print'):
-            self.assertEqual(main(), 1)
+            self.assertEqual(main(), 0)
         posts = self.posts()
-        self.assertEqual(len(posts), 2)
-        self.assertEqual(len({url for url, _ in posts}), 2)
-        self.assertTrue(all(b[1] - a[1] >= 3600 for a, b in zip(posts, posts[1:])))
+        self.assertEqual(len(posts), 9)
+        self.assertEqual(len({url for url, _ in posts}), 9)
+        self.assertTrue(all(b[1] - a[1] >= 600 for a, b in zip(posts, posts[1:])))
 
     def test_missing_policy_fails_even_when_every_other_policy_is_verified(self):
         from capture import main, POLICIES
@@ -3358,6 +3405,41 @@ class DailyBatchPipelineTests(unittest.TestCase):
         self.r.run_daily_queue(targets, 'policies')
         self.assertEqual([url for url, _ in self.posts()], [BASE + '/cart'])
         self.assertEqual(self.verified(), set(targets))
+
+    def test_cart_processed_before_post_batch_verification_outage(self):
+        from capture import POLICIES
+        targets = [BASE + path for path in POLICIES]
+        # Eight pages have current usable evidence. The remaining cart must not
+        # sit behind a second shared query for the first eight pages.
+        for i, url in enumerate(targets[:-1]):
+            self.jobs[url] = {'id': 'existing-' + str(i), 'at': self.since + 60}
+        normal = self.c._request.side_effect
+        queries = [0]
+        def request(url, data=None, authenticated=False):
+            if '/cdx/' in url:
+                queries[0] += 1
+                if queries[0] > 1:
+                    self.calls.append((url, data, self.now))
+                    self.now += 2
+                    return 200, {}, json.dumps([FIELDS, ['malformed']]), url
+            return normal(url, data, authenticated)
+        self.c._request.side_effect = request
+        self.r.run_daily_queue(targets, 'policies')
+        self.assertEqual([url for url, _ in self.posts()], [BASE + '/cart'])
+        self.assertEqual(self.verified(), set(targets[:-1]))
+        self.assertEqual(self.r.state['_queues']['policies:20261104:capture:daily-v3']['cursor'], 9)
+        self.assertIn(BASE + '/cart', self.r.state)  # Accepted job preserved.
+        self.assertFalse(any('/products/' in url for url, _, _ in self.calls))
+
+    def test_nine_page_batch_validation_stays_limited_to_policies(self):
+        from capture import POLICIES, validate_state, StateContinuityError
+        targets = [BASE + p for p in POLICIES]
+        q = {'urls': targets, 'cursor': 0, 'results': [], 'complete': False,
+             'phase': 'index_before', 'batch_start': 0, 'batch_end': 9}
+        state = {'_queues': {'policies:20261104:capture:daily-v3': q}}
+        validate_state(state)
+        with self.assertRaises(StateContinuityError):
+            validate_state({'_queues': {'all:20261104:capture:daily-v3': q}})
 
     def test_incomplete_index_stops_all_later_work_without_submission(self):
         self.index_unavailable = True
