@@ -33,6 +33,10 @@ OUTLINK_PROBE = BASE + '/collections/all'
 UTC = dt.timezone.utc
 # An unresolved save older than this is released for one fresh save.
 STUCK_JOB_SECONDS = 86400
+# A page is covered for the UTC day when the strict index check verified it,
+# or when the Wayback Machine's own authenticated save-status service
+# confirmed a fresh, matching save made that day ("saved").
+COVERED_STATES = ('verified', 'saved')
 
 def timestamp(epoch):
     return dt.datetime.fromtimestamp(epoch, UTC).strftime('%Y%m%d%H%M%S')
@@ -283,7 +287,7 @@ def operational_summary(state):
         rows = rows if isinstance(rows, list) else []
         for row in rows:
             label = row.get('state') if isinstance(row, dict) else 'unknown'
-            if label not in ('verified', 'unverified', 'deferred', 'pending', 'failed', 'review_required', 'reused', 'unsupported-document-type', 'discovery-incomplete', 'no-additional-targets', 'outlink-held', 'state-held'):
+            if label not in ('verified', 'saved', 'unverified', 'deferred', 'pending', 'failed', 'review_required', 'reused', 'unsupported-document-type', 'discovery-incomplete', 'no-additional-targets', 'outlink-held', 'state-held'):
                 label = 'unknown'
             counts[label] = counts.get(label, 0) + 1
         queues.append({'key': key, 'total': total, 'cursor': cursor,
@@ -1210,6 +1214,9 @@ class Runner:
         self.deadline, self.interval = self.started + budget, max(60, interval)
         self.verify_only = verify_only
         self.poll_only = poll_only
+        # Only the nine-page policies run counts a save the save-status
+        # service confirmed; every other scope still needs the index.
+        self.count_status_saves = False
         self.next_submit = self.state.get('_next_submit', 0)
         self.results = []
         self.transport_failure_streak = 0
@@ -1289,6 +1296,15 @@ class Runner:
         print(json.dumps(row), flush=True)
         Path('capture-report.json').write_text(json.dumps(self.results, indent=2))
         return row
+
+    def in_utc_day(self, value):
+        return (isinstance(value, str) and bool(re.fullmatch(r'[0-9]{14}', value))
+                and value[:8] == timestamp(self.since)[:8])
+
+    def saved_result(self, url, ts):
+        return self.result(url, 'saved', timestamp=ts, capture_timestamp=ts,
+                           replay_url='https://web.archive.org/web/' + ts + '/' + url,
+                           reason='save confirmed by Wayback save-status service; index not yet checked')
 
     def stuck_job_expired(self, pending):
         started = latest_attempt_time(pending)
@@ -1635,6 +1651,7 @@ class Runner:
         """
         if scope not in ('all', 'priority', 'policies'):
             raise ValueError('Daily batches require all, priority or policies scope')
+        self.count_status_saves = scope == 'policies'
         mode = 'verify' if self.verify_only else 'poll' if self.poll_only else 'capture'
         prefix = scope + ':' + timestamp(self.since)[:8] + ':' + mode
         # Keep the nine essential targets together: a failed post-batch index
@@ -1650,14 +1667,16 @@ class Runner:
         rebuild = not queue or queue['complete'] or scope in ('priority', 'policies')
         if rebuild:
             verified = [r for r in (previous or {}).get('results', [])
-                        if r.get('state') == 'verified' and r.get('url') in targets
+                        if r.get('state') in COVERED_STATES and r.get('url') in targets
                         and re.fullmatch(timestamp(self.since)[:8] + r'[0-9]{6}', str(r.get('timestamp', '')))]
             if queue:
                 history = key + ':pass:' + str(len(queues))
                 while history in queues:
                     history += '0'
                 queues[history] = queue
-            covered = {r['url'] for r in verified}
+            # A page counted only by its save confirmation stays in the queue
+            # so the index can upgrade it; _process never saves it twice.
+            covered = {r['url'] for r in verified if r.get('state') == 'verified'}
             remaining = [u for u in targets if u not in covered]
             retry = (previous or {}).get('retry_same_url')
             if retry in remaining:
@@ -1695,16 +1714,20 @@ class Runner:
                     or time.time() + 120 >= min(self.deadline, self.since + 86400)):
                 break
             start, end = queue['batch_start'], queue['batch_end']
-            covered = {r['url'] for r in queue['results'] if r.get('state') == 'verified'}
+            covered = {r['url'] for r in queue['results'] if r.get('state') in COVERED_STATES}
             if queue['phase'] in ('index_before', 'index_after'):
                 before = queue['phase'] == 'index_before'
+                # A save confirmed only by the save-status service is still
+                # checked against the index, so it upgrades to verified when
+                # the index can be reached.
+                strict = {r['url'] for r in queue['results'] if r.get('state') == 'verified'}
                 selection = queue['urls'][queue['cursor'] if before else start:end]
-                selection = [u for u in selection if u in targets and u not in covered]
+                selection = [u for u in selection if u in targets and u not in strict]
                 try:
                     for url, evidence in self.client.verify_many(selection, self.since, until=self.until):
                         if evidence:
                             self.verified_result(url, evidence, 'shared_index')
-                        else:
+                        elif url not in covered:
                             self.result(url, 'unverified', reason='no usable capture in complete shared index snapshot')
                         checkpoint()
                 except (LookupFailure, RequestDeferred, ValueError, OSError) as exc:
@@ -1721,7 +1744,7 @@ class Runner:
                              and not self.client.archive_requests_stopped
                              and ready + 120 < min(self.deadline, self.since + 86400))
                     for url in selection:
-                        if not any(r.get('url') == url and r.get('state') == 'verified' for r in queue['results']):
+                        if not any(r.get('url') == url and r.get('state') in COVERED_STATES for r in queue['results']):
                             self.result(url, 'deferred', reason='shared index/replay unavailable; batch checkpoint retained',
                                         error_class=type(exc).__name__, lookup_failure=detail,
                                         lookup_retry_scheduled=retry)
@@ -1733,7 +1756,19 @@ class Runner:
                         checkpoint()  # Persist the wait before sleeping or restarting.
                         time.sleep(max(0, ready - time.time()))
                         continue
-                    break
+                    if (not self.count_status_saves or self.verify_only or self.poll_only
+                            or self.pause_circuit_open or self.transport_circuit_open
+                            or self.client.archive_requests_stopped
+                            or detail.get('phase') != 'index'
+                            or detail.get('reason') == 'local_request_deferred'):
+                        break
+                    # The index is often unreachable from GitHub's runners
+                    # while saves and save-status lookups still work. An
+                    # unreachable index is no reason to skip saving: carry on
+                    # (before) or close the batch (after) and let the
+                    # save-status confirmation count instead. A replay
+                    # failure is different: the index already showed a
+                    # capture, so nothing is saved twice.
                 if before and not self.verify_only:
                     queue['phase'] = 'capture'
                     checkpoint()
@@ -1789,7 +1824,7 @@ class Runner:
         if not queue['complete']:
             self.daily_stopped = True
         for url in queue['urls'][queue['cursor']:]:
-            if not any(r.get('url') == url and r.get('state') == 'verified' for r in queue['results']):
+            if not any(r.get('url') == url and r.get('state') in COVERED_STATES for r in queue['results']):
                 self.result(url, 'deferred', reason='daily batch checkpoint retained; coverage incomplete')
 
     def outlink_submission_hold(self, url):
@@ -2111,6 +2146,14 @@ class Runner:
                 return self.verified_result(url, evidence, 'existing_index')
             pending = self.state.get(url)
             created_pending = False
+            confirmed = pending.get('status_saved') if pending and self.count_status_saves else None
+            if confirmed:
+                if self.in_utc_day(confirmed):
+                    return self.saved_result(url, confirmed)
+                if not (self.verify_only or self.poll_only):
+                    # Yesterday's confirmed save is complete; today needs its own.
+                    self.retire_pending(url, 'saved_released')
+                    pending = None
             if pending and pending.get('known_not_sent') is True and not pending.get('job_id') and not (self.verify_only or self.poll_only):
                 # This explicit marker is written only by the instrumented new
                 # attempt path. Historical no-job states are never promoted.
@@ -2302,6 +2345,14 @@ class Runner:
                         pending['review_required'] = True
                         self.save()
                         return self.result(url, 'review_required', reason='job success lacks usable matching archive evidence; retained for review')
+                    if self.count_status_saves and self.in_utc_day(returned_timestamp):
+                        # The authenticated save-status service confirmed a
+                        # fresh save of this exact page today. Count it even
+                        # when the index cannot be reached; the job is kept
+                        # so the index can still verify it later.
+                        pending['status_saved'] = returned_timestamp
+                        self.save()
+                        return self.saved_result(url, returned_timestamp)
                     # Indexing can lag. Keep job ID for later runs; do not resubmit.
                 elif obj.get('status') == 'error':
                     # A live accepted job returned bad-request despite a usable
@@ -2326,6 +2377,9 @@ class Runner:
         except (LookupFailure, ValueError, OSError) as exc:
             detail = getattr(exc, 'transport', None)
             if detail:
+                # Scalar diagnostics only; never raw server or exception text.
+                detail = {k: v for k, v in detail.items()
+                          if k in ('phase', 'reason_class', 'known_not_sent', 'errno')}
                 self._operation_transport_failed = True
                 pending = self.state.get(url)
                 if pending:
@@ -2340,7 +2394,7 @@ class Runner:
 
 def daily_summary(urls, results, since, inventory_complete=True, priority_paths=None):
     day = timestamp(since)[:8]
-    verified = {row['url'] for row in results if row.get('state') == 'verified'
+    verified = {row['url'] for row in results if row.get('state') in COVERED_STATES
                 and isinstance(row.get('timestamp'), str)
                 and re.fullmatch(day + r'[0-9]{6}', row['timestamp'])}
     missing = [path for path in (PRIORITY if priority_paths is None else priority_paths) if BASE + path not in verified]

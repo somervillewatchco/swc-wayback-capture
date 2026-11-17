@@ -3631,7 +3631,9 @@ class DailyBatchPipelineTests(unittest.TestCase):
         self.r.state[URL] = {'job_id': 'retained-job', 'submitted_at': self.since}
         self.r.save()
         self.r.run_daily_queue([URL], 'policies')
-        self.assertEqual(len(self.calls), 6)  # 3 rounds x existing 2 GET attempts.
+        # 3 index rounds x 2 GET attempts, then the retained job's save-status
+        # (2 attempts) and the closing index read (2 attempts). Never a new save.
+        self.assertEqual(len(self.calls), 10)
         self.assertEqual(self.posts(), [])
         self.assertEqual(self.r.state[URL]['job_id'], 'retained-job')
         detail = next(r['lookup_failure'] for r in self.r.results if 'lookup_failure' in r)
@@ -3639,11 +3641,12 @@ class DailyBatchPipelineTests(unittest.TestCase):
         self.assertEqual(detail['errno'], 111)
         self.assertNotIn('SECRET', json.dumps(self.r.results))
 
-    def test_malformed_index_reports_reason_without_retry_or_submission(self):
+    def test_malformed_index_reports_reason_without_retry_and_still_saves(self):
         self.index_unavailable = True
         self.r.run_daily_queue([URL], 'policies')
-        self.assertEqual(len(self.calls), 1)
-        self.assertEqual(self.posts(), [])
+        self.assertEqual(self.posts(), [(URL, self.since + 542)])
+        self.assertEqual(sum('/cdx/' in url for url, _, _ in self.calls), 2)
+        self.assertEqual(self.r.results[-1]['state'], 'saved')
         detail = self.r.results[0]['lookup_failure']
         self.assertEqual(detail['reason'], 'incomplete_cdx_row')
         self.assertEqual(detail['http_status'], 200)
@@ -3684,14 +3687,89 @@ class DailyBatchPipelineTests(unittest.TestCase):
         self.assertEqual(detail['phase'], 'replay')
         self.assertEqual(detail['http_status'], 503)
 
+    def refuse_index(self):
+        normal = self.normal_request = getattr(self, 'normal_request', self.c._request.side_effect)
+        def refused(url, data=None, authenticated=False):
+            if '/cdx/' in url:
+                self.calls.append((url, data, self.now))
+                self.now += 2
+                raise LookupFailure('refused', transport={
+                    'phase': 'tcp_connect', 'reason_class': 'ConnectionRefusedError',
+                    'errno': 111, 'known_not_sent': True})
+            return normal(url, data, authenticated)
+        self.c._request.side_effect = refused
+
+    def test_nov_16_refused_index_still_saves_all_nine_and_exits_cleanly(self):
+        # Mirrors Nov 16: every index read is refused from the runner, while
+        # saves and the save-status service work.
+        from capture import main, POLICIES
+        self.now = self.since + 9 * 3600
+        self.restart(budget=19800)
+        self.refuse_index()
+        with patch('sys.argv', ['capture.py', '--scope', 'policies', '--daily-batches', '--state', 'state.json']), \
+                patch('capture.Client', return_value=self.c), patch('builtins.print'):
+            self.assertEqual(main(), 0)
+        targets = {BASE + path for path in POLICIES}
+        self.assertEqual({u for u, _ in self.posts()}, targets)
+        self.assertEqual(len(self.posts()), 9)
+        state = json.loads(Path('state.json').read_text())
+        for url in targets:
+            self.assertRegex(state[url]['status_saved'], '^20261104')
+        self.assertTrue(all(b[2] - a[2] >= 122 for a, b in zip(self.calls, self.calls[1:])))
+
+    def test_confirmed_save_is_not_resubmitted_the_same_day(self):
+        self.refuse_index()
+        self.r.run_daily_queue([URL], 'policies')
+        self.assertEqual(len(self.posts()), 1)
+        self.now += 3600
+        self.restart(budget=19800)
+        self.refuse_index()
+        self.r.run_daily_queue([URL], 'policies')
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual(self.r.results[-1]['state'], 'saved')
+
+    def test_yesterdays_confirmed_save_gets_a_fresh_save_today(self):
+        self.refuse_index()
+        self.r.run_daily_queue([URL], 'policies')
+        self.assertEqual(len(self.posts()), 1)
+        self.jobs.clear()  # The fake archive accepts the page again tomorrow.
+        self.now = self.since + 86400 + 9 * 3600
+        self.since += 86400
+        self.restart(budget=19800)
+        self.refuse_index()
+        self.r.run_daily_queue([URL], 'policies')
+        self.assertEqual(len(self.posts()), 2)
+        state = json.loads(Path('state.json').read_text())
+        self.assertRegex(state[URL]['status_saved'], '^20261105')
+        self.assertIn('saved_released', json.dumps(state.get('_completed_jobs')))
+
+    def test_confirmed_save_upgrades_to_verified_when_index_returns(self):
+        self.refuse_index()
+        self.r.run_daily_queue([URL], 'policies')
+        self.assertEqual(self.r.results[-1]['state'], 'saved')
+        self.now += 3600
+        self.c._request.side_effect = self.normal_request  # The index answers again.
+        self.restart(budget=19800)
+        self.r.run_daily_queue([URL], 'policies')
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual(self.verified(), {URL})
+
+    def test_refused_index_keeps_priority_and_product_runs_strict(self):
+        self.refuse_index()
+        self.r.run_daily_queue([URL], 'priority')
+        self.r.run_daily_queue([self.product], 'all')
+        self.assertEqual(self.posts(), [])
+        self.assertFalse(any(r.get('state') == 'saved' for r in self.r.results))
+
     def test_lookup_retry_cannot_cross_utc_day(self):
         self.now = self.since + 86400 - 600
         self.restart()
         self.c._request.side_effect = lambda url, data=None, authenticated=False: (
             self.calls.append((url, data, self.now)) or (503, {}, '{}', url))
         self.r.run_daily_queue([URL], 'policies')
-        self.assertEqual(len(self.calls), 2)
-        self.assertEqual(self.posts(), [])
+        # No index retry is scheduled past midnight; the one save happens
+        # before midnight and its unknown outcome is never resubmitted.
+        self.assertLessEqual(len(self.posts()), 1)
         self.assertTrue(all(at < self.since + 86400 for _, _, at in self.calls))
         self.assertFalse(self.r.results[0]['lookup_retry_scheduled'])
 
