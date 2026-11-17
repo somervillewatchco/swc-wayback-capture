@@ -669,17 +669,36 @@ class RunnerTests(unittest.TestCase):
                 self.c.json.assert_not_called()
                 self.assertEqual(self.r.state[URL]['job_id'], 'saved-job')
 
-    def test_old_unknown_and_pending_jobs_are_not_released_by_age(self):
-        for job in (None, 'still-pending'):
-            with self.subTest(job=job):
-                self.r.state[URL] = {'submitted_at': self.r.since - 7 * 86400}
-                if job:self.r.state[URL]['job_id'] = job
+    def test_stuck_unknown_pending_and_review_jobs_get_one_fresh_save(self):
+        for extra in ({}, {'job_id': 'still-pending'}, {'job_id': 'held', 'review_required': True}):
+            with self.subTest(extra=extra):
+                self.r.state[URL] = {'submitted_at': self.r.since - 7 * 86400, **extra}
+                self.r.state['_next_submit'] = self.r.next_submit = 0
+                self.r.save()
+                self.c.json.reset_mock()
+                self.c.json.side_effect = [(200, {}, {'job_id': 'fresh-job'})] + [(200, {}, {'status': 'pending'})] * 12
+                self.assertEqual(self.r.process(URL)['state'], 'pending')
+                posts = [c for c in self.c.json.call_args_list if c.args[0] == 'https://web.archive.org/save/']
+                self.assertEqual(len(posts), 1)
+                self.assertEqual(self.r.state[URL]['job_id'], 'fresh-job')
+                self.assertEqual(self.r.state['_completed_jobs'][-1]['state'], 'stuck_released')
+                self.assertEqual(self.r.state['_completed_jobs'][-1].get('job_id'), extra.get('job_id'))
+                self.c.json.side_effect = None
+
+    def test_recent_or_read_only_stuck_jobs_are_not_released(self):
+        for mode in ('recent', 'verify_only', 'poll_only'):
+            with self.subTest(mode=mode):
+                age = 3600 if mode == 'recent' else 7 * 86400
+                self.r.state[URL] = {'submitted_at': time.time() - age, 'job_id': 'still-pending'}
+                self.r.verify_only = mode == 'verify_only'
+                self.r.poll_only = mode == 'poll_only'
                 self.r.save()
                 self.c.json.reset_mock()
                 self.c.json.return_value = (200, {}, {'status': 'pending'})
-                self.assertEqual(self.r.process(URL)['state'], 'pending')
+                self.r.process(URL)
                 self.assertFalse(any(c.args[0] == 'https://web.archive.org/save/' for c in self.c.json.call_args_list))
-                self.assertEqual(self.r.state[URL].get('job_id'), job)
+                self.assertEqual(self.r.state[URL].get('job_id'), 'still-pending')
+        self.r.verify_only = self.r.poll_only = False
 
     def test_terminal_reused_poll_only_never_releases_even_when_due(self):
         self.old_success_state(); self.r.process(URL)
@@ -3686,10 +3705,10 @@ class PolicyScheduleTests(unittest.TestCase):
         row.update(changes)
         return row
 
-    def test_retry_only_for_same_day_failed_primary(self):
+    def test_retry_only_for_recent_failed_primary(self):
         import datetime as dt
         from capture_schedule import retry_decision
-        today = dt.date(2026, 11, 5)
+        now = dt.datetime(2026, 11, 5, 21, 0, tzinfo=dt.timezone.utc)
         cases = [({}, True), ({'conclusion': 'timed_out'}, True),
                  ({'conclusion': 'success'}, False), ({'conclusion': 'cancelled'}, False),
                  ({'status': 'in_progress', 'conclusion': None}, False),
@@ -3699,14 +3718,23 @@ class PolicyScheduleTests(unittest.TestCase):
                  ({'event': 'workflow_dispatch'}, False), ({'head_branch': 'other'}, False)]
         for changes, expected in cases:
             with self.subTest(changes=changes):
-                self.assertEqual(retry_decision([self.primary(**changes)], today)[0], expected)
-        self.assertFalse(retry_decision([], today)[0])
+                self.assertEqual(retry_decision([self.primary(**changes)], now)[0], expected)
+        self.assertFalse(retry_decision([], now)[0])
 
     def test_latest_primary_success_prevents_retry_of_older_failure(self):
         import datetime as dt
         from capture_schedule import retry_decision
         runs = [self.primary(), self.primary(id=124, created_at='2026-11-05T10:00:00Z', conclusion='success')]
-        self.assertFalse(retry_decision(runs, dt.date(2026, 11, 5))[0])
+        now = dt.datetime(2026, 11, 5, 21, 0, tzinfo=dt.timezone.utc)
+        self.assertFalse(retry_decision(runs, now)[0])
+
+    def test_retry_delivered_after_midnight_utc_still_captures(self):
+        # Mirrors Nov 16: primary began 19:28 UTC and failed; retry arrived 03:36 UTC Nov 17.
+        import datetime as dt
+        from capture_schedule import retry_decision
+        runs = [self.primary(created_at='2026-11-16T19:28:00Z')]
+        now = dt.datetime(2026, 11, 17, 3, 36, tzinfo=dt.timezone.utc)
+        self.assertTrue(retry_decision(runs, now)[0])
 
     def test_primary_manual_and_superseded_schedule_gate_without_network(self):
         from capture_schedule import main, PRIMARY_CRON
@@ -3738,7 +3766,7 @@ class PolicyScheduleTests(unittest.TestCase):
     def test_retry_reads_github_once_and_exports_decision(self):
         import datetime as dt
         from capture_schedule import main, RETRY_CRON
-        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        started = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ')
         with tempfile.TemporaryDirectory() as temp:
             for conclusion, expected in [('failure', True), ('success', False)]:
                 output = Path(temp) / 'output'
@@ -3747,7 +3775,7 @@ class PolicyScheduleTests(unittest.TestCase):
                 response.__enter__ = Mock(return_value=response)
                 response.__exit__ = Mock(return_value=False)
                 response.read.return_value = json.dumps({'workflow_runs': [
-                    self.primary(created_at=today + 'T09:00:00Z', conclusion=conclusion)]}).encode()
+                    self.primary(created_at=started, conclusion=conclusion)]}).encode()
                 with patch.dict(os.environ, {'GITHUB_EVENT_NAME': 'schedule', 'SCHEDULE': RETRY_CRON,
                         'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_TOKEN': 'test',
                         'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': ''}), \
@@ -3757,33 +3785,23 @@ class PolicyScheduleTests(unittest.TestCase):
                 self.assertEqual(output.read_text(), 'run_capture=' + str(expected).lower() + '\n')
 
 
-    def test_delayed_retry_after_midnight_reports_failure_without_capture(self):
+    def test_delayed_retry_after_midnight_captures_and_exits_cleanly(self):
         import datetime as dt
         from capture_schedule import main, RETRY_CRON
-        yesterday = (dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)).isoformat()
+        earlier = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=8)).strftime('%Y-%m-%dT%H:%M:%SZ')
         with tempfile.TemporaryDirectory() as temp:
-            output, summary = Path(temp) / 'output', Path(temp) / 'summary'
+            output = Path(temp) / 'output'
             response = Mock()
             response.__enter__ = Mock(return_value=response)
             response.__exit__ = Mock(return_value=False)
             response.read.return_value = json.dumps({'workflow_runs': [
-                self.primary(created_at=yesterday + 'T16:40:37Z')]}).encode()
+                self.primary(created_at=earlier)]}).encode()
             with patch.dict(os.environ, {'GITHUB_EVENT_NAME': 'schedule', 'SCHEDULE': RETRY_CRON,
                     'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_TOKEN': 'test',
-                    'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': str(summary)}), \
+                    'GITHUB_OUTPUT': str(output), 'GITHUB_STEP_SUMMARY': ''}), \
                     patch('capture_schedule.urllib.request.urlopen', return_value=response):
-                self.assertEqual(main(), 1)
-            self.assertEqual(output.read_text(), 'run_capture=false\n')
-            self.assertIn('Missed retry:', summary.read_text())
-
-
-    def test_previous_day_failure_superseded_by_success_is_not_a_missed_retry(self):
-        import datetime as dt
-        from capture_schedule import retry_decision
-        runs = [self.primary(), self.primary(id=124, created_at='2026-11-05T10:00:00Z', conclusion='success')]
-        allowed, reason = retry_decision(runs, dt.date(2026, 11, 6))
-        self.assertFalse(allowed)
-        self.assertFalse(reason.startswith('Missed retry:'))
+                self.assertEqual(main(), 0)
+            self.assertEqual(output.read_text(), 'run_capture=true\n')
 
 
 if __name__ == '__main__': unittest.main()

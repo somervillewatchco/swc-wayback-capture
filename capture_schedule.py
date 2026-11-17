@@ -11,26 +11,24 @@ PRIMARY_CRON = '0 9 * * *'
 RETRY_CRON = '0 21 * * *'
 
 
-def retry_decision(runs, today):
+def retry_decision(runs, now):
+    """Allow one retry when the latest scheduled primary from the last 24 hours failed.
+
+    GitHub regularly delivers the 4 p.m. EST retry after midnight UTC. Keying on
+    the most recent primary (not the current UTC date) lets a late retry still
+    capture instead of failing in about a minute without saving anything.
+    """
+    window_start = now - dt.timedelta(hours=24)
     candidates = []
-    previous = []
     for run in runs:
         if (run.get('event') != 'schedule' or run.get('head_branch') != 'main'
                 or run.get('display_title') != PRIMARY_TITLE):
             continue
         created = dt.datetime.fromisoformat(run['created_at'].replace('Z', '+00:00'))
-        if created.date() == today:
+        if window_start <= created <= now:
             candidates.append(run)
-        elif created.date() == today - dt.timedelta(days=1):
-            previous.append(run)
-    if not candidates and previous:
-        latest = max(previous, key=lambda row: (row['created_at'], row['id']))
-        if (latest.get('status') == 'completed'
-                and latest.get('conclusion') in ('failure', 'timed_out', 'startup_failure')):
-            return False, ('Missed retry: previous UTC day has a failed primary, but its coverage day has ended; '
-                           'no capture authorized. Daily coverage is unresolved.')
     if not candidates:
-        return False, 'No primary run recorded for this UTC day; retry skipped.'
+        return False, 'No primary run in the last 24 hours; retry skipped.'
     primary = max(candidates, key=lambda row: (row['created_at'], row['id']))
     if primary.get('status') != 'completed':
         return False, 'Primary is not completed; retry skipped.'
@@ -52,7 +50,7 @@ def main():
         # An unavailable/invalid API response fails the gate, never authorizes capture.
         with urllib.request.urlopen(request, timeout=30) as response:
             runs = json.load(response)['workflow_runs']
-        allowed, reason = retry_decision(runs, dt.datetime.now(dt.timezone.utc).date())
+        allowed, reason = retry_decision(runs, dt.datetime.now(dt.timezone.utc))
     else:
         allowed, reason = False, 'Superseded schedule; capture skipped.'
     with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
@@ -61,9 +59,7 @@ def main():
         with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
             summary.write('Schedule decision: ' + reason + '\n')
     print(reason)
-    # A late failed-day continuation is a missed coverage opportunity, not a
-    # successful archive run. Keep the cutoff; never backdate a new submission.
-    return 1 if reason.startswith('Missed retry:') else 0
+    return 0
 
 
 if __name__ == '__main__':

@@ -31,6 +31,8 @@ PACING_PROBE = BASE + '/products/date-mod-olive-green-watch'
 SUPPLEMENTAL_PROBE = BASE + '/pages/about-us'
 OUTLINK_PROBE = BASE + '/collections/all'
 UTC = dt.timezone.utc
+# An unresolved save older than this is released for one fresh save.
+STUCK_JOB_SECONDS = 86400
 
 def timestamp(epoch):
     return dt.datetime.fromtimestamp(epoch, UTC).strftime('%Y%m%d%H%M%S')
@@ -1288,6 +1290,10 @@ class Runner:
         Path('capture-report.json').write_text(json.dumps(self.results, indent=2))
         return row
 
+    def stuck_job_expired(self, pending):
+        started = latest_attempt_time(pending)
+        return started is None or time.time() - started >= STUCK_JOB_SECONDS
+
     def retire_pending(self, url, state, **details):
         # Audit before removing, including transitions that do not emit a row.
         completed = self.state.setdefault('_completed_jobs', [])
@@ -2131,6 +2137,16 @@ class Runner:
                     return self.result(url, 'deferred', reason='completed reused capture; awaiting next eligible UTC-day opportunity')
                 # Preserve a bounded audit trail before the next regular attempt.
                 self.retire_pending(url, 'reused_released')
+                pending = None
+            if (pending and not pending.get('terminal_reused') and not is_product(url)
+                    and not (self.verify_only or self.poll_only)
+                    and self.stuck_job_expired(pending)):
+                # A page save still unresolved after STUCK_JOB_SECONDS (pending,
+                # unknown outcome or held for review) gets a fresh save.
+                # Product pages keep their own once-per-day rules. A
+                # duplicate Wayback save is harmless; a page that is never
+                # saved again is not. The old record stays in the audit trail.
+                self.retire_pending(url, 'stuck_released')
                 pending = None
             if pending and pending.get('review_required'):
                 return self.result(url, 'review_required', reason='saved job outcome needs review; archive evidence still checked, no submission or status polling')
