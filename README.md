@@ -38,6 +38,20 @@ Existing saved matching success metadata is migrated using read-only archive evi
 
 Recovery restores the explicitly requested cache only, without prefix fallback, and saves under `wayback-recovery-v1-*`, never under the production `wayback-state-v1-*` prefix. Thus inspecting an older snapshot cannot promote it into production state. Cache eviction can still lose history; inspect evidence before manually repeating uncertain submissions.
 
+## Stuck saves and late retries (Nov 17 change)
+
+A non-product page whose saved job is still unresolved 24 hours after its last save attempt (pending, unknown outcome or held for review) is released for one fresh save on the next normal run. The old record is kept in the `_completed_jobs` audit trail as `stuck_released`. Read-only and poll-only runs never release anything. Before this, four policy pages sat on old unresolved jobs from early November and were never saved again.
+
+The 4 p.m. EST retry now runs whenever the most recent scheduled primary in the last 24 hours failed. GitHub delivers that schedule several hours late, usually after midnight UTC, so the old same-UTC-day rule turned every retry into a one-minute failure that saved nothing.
+
+## Counting the save confirmation (policies run only)
+
+From GitHub's runners the Wayback index (CDX) often refuses connections while saves and the authenticated save-status service still work. On Nov 16 every index read was refused, so the nine policy and cart pages were never checked and the run failed, even though saves went through.
+
+In the `policies` daily run only, an unreachable index no longer stops the batch. The page is saved as usual, and when the save-status service reports `success` with a timestamp from the current UTC day and the exact page address, the page is counted as `saved`. The daily summary treats `saved` like `verified`, so the run exits cleanly. A later run that can reach the index still checks a `saved` page and upgrades it to `verified`, without saving it again. A confirmation from an earlier day is retired as `saved_released` and the page gets one fresh save.
+
+What has not changed: the `priority` and `all` runs, and every product page, still need the index. A replay failure (the index showed a capture but the replay check failed) never leads to a second save. Pacing, pause and transport circuit breakers, read-only and poll-only modes and the UTC-day boundary all still apply.
+
 ## Supplemental published-site inventory
 
 `--scope supplemental` reads the public same-origin sitemap index and its nested indexes, then selects published pages, named collections, blog indexes/posts and any other sitemap URLs **outside** the existing priority + catalog/product (`all`) inventory. It does not revisit the existing all-scope target set simply because some targets failed. Both inventories must finish before any capture is attempted. This is bounded discovery, not an arbitrary website crawl: at most 32 sitemap documents, nesting depth 4, and 5,000 target URLs; DTD/entities and unexpected XML are rejected. Only direct standard sitemap URL locations are targets; image/video namespace locations and external origins are excluded.
